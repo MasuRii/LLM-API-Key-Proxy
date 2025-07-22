@@ -13,6 +13,7 @@ import logging
 from typing import List, Dict, Any, AsyncGenerator, Optional, Union
 
 lib_logger = logging.getLogger('rotator_library')
+trace_logger = logging.getLogger('litellm_trace')
 # Ensure the logger is configured to propagate to the root logger
 # which is set up in main.py. This allows the main app to control
 # log levels and handlers centrally.
@@ -107,30 +108,26 @@ class RotatingClient:
 
     def _litellm_logger_callback(self, log_data: dict):
         """
-        Callback function to redirect litellm's logs to the library's logger.
-        This allows us to control the log level and destination of litellm's output.
-        It also cleans up error logs for better readability in debug files.
+        Callback function to redirect litellm's logs.
+        - Raw, verbose logs are sent to the 'litellm_trace' logger.
+        - Cleaned, summarized error logs are sent to the main library logger.
         """
-        # For successful calls or pre-call logs, a simple debug message is enough.
-        if not log_data.get("exception"):
-            sanitized_log = self._sanitize_litellm_log(log_data)
-            # We log it at the DEBUG level to ensure it goes to the debug file
-        # and not the console, based on the main.py configuration.
-            lib_logger.debug(f"LiteLLM Log: {sanitized_log}")
-            return
+        # The trace logger gets the full, raw log data.
+        # We convert it to a string because the logger expects a message.
+        trace_logger.debug(json.dumps(log_data, default=str))
 
-        # For failures, extract key info to make debug logs more readable.
-        model = log_data.get("model", "N/A")
-        call_id = log_data.get("litellm_call_id", "N/A")
-        error_info = log_data.get("standard_logging_object", {}).get("error_information", {})
-        error_class = error_info.get("error_class", "UnknownError")
-        error_message = error_info.get("error_message", str(log_data.get("exception", "")))
-        error_message = ' '.join(error_message.split()) # Sanitize
+        # If it's a failure, we also log a cleaned-up version to the main debug log.
+        if log_data.get("exception"):
+            model = log_data.get("model", "N/A")
+            error_info = log_data.get("standard_logging_object", {}).get("error_information", {})
+            error_class = error_info.get("error_class", "UnknownError")
+            error_message = error_info.get("error_message", str(log_data.get("exception", "")))
+            error_message = ' '.join(error_message.split()) # Sanitize
 
-        lib_logger.debug(
-            f"LiteLLM Callback Handled Error: Model={model} | "
-            f"Type={error_class} | Message='{error_message}'"
-        )
+            lib_logger.debug(
+                f"LiteLLM Handled Error: Model={model} | "
+                f"Type={error_class} | Message='{error_message}'"
+            )
 
     async def __aenter__(self):
         return self
@@ -204,7 +201,7 @@ class RotatingClient:
                 except StopAsyncIteration:
                     stream_completed = True
                     if json_buffer:
-                        lib_logger.info(f"Stream ended with incomplete data in buffer: {json_buffer}")
+                        lib_logger.warning(f"Stream ended with incomplete data in buffer: {json_buffer}")
                     break
 
                 except (litellm.RateLimitError, litellm.ServiceUnavailableError, litellm.InternalServerError, APIConnectionError) as e:
@@ -239,7 +236,7 @@ class RotatingClient:
                         parsed_data = json.loads(json_buffer)
                         
                         # If parsing succeeds, we have the complete object.
-                        lib_logger.info(f"Successfully reassembled JSON from stream: {json_buffer}")
+                        lib_logger.warning(f"Successfully reassembled JSON from stream: {json_buffer}")
                         
                         # Wrap the complete error object and raise it. The outer function will decide how to handle it.
                         raise StreamedAPIError("Provider error received in stream", data=parsed_data)

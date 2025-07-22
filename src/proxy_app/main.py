@@ -45,58 +45,50 @@ from proxy_app.batch_manager import EmbeddingBatcher
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-# Configure a file handler for INFO-level logs and higher
+# 1. Root Logger (for general application logs)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG) # Capture all levels
+
+# 2. Console Handler (INFO and up, colored, no litellm)
+console_handler = colorlog.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = colorlog.ColoredFormatter(
+    '%(log_color)s%(message)s',
+    log_colors={'DEBUG':'cyan', 'INFO':'green', 'WARNING':'yellow', 'ERROR':'red', 'CRITICAL':'red,bg_white'}
+)
+console_handler.setFormatter(console_formatter)
+# Filter out raw litellm trace logs from the console
+console_handler.addFilter(lambda record: record.name != 'litellm_trace')
+root_logger.addHandler(console_handler)
+
+# 3. Info File Handler (proxy.log - mirrors console)
 info_file_handler = logging.FileHandler(LOG_DIR / "proxy.log", encoding="utf-8")
 info_file_handler.setLevel(logging.INFO)
 info_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+# Filter out raw litellm trace logs from this file
+info_file_handler.addFilter(lambda record: record.name != 'litellm_trace')
+root_logger.addHandler(info_file_handler)
 
-# Configure a dedicated file handler for all DEBUG-level logs
+# 4. Debug File Handler (proxy_debug.log - all logs)
 debug_file_handler = logging.FileHandler(LOG_DIR / "proxy_debug.log", encoding="utf-8")
 debug_file_handler.setLevel(logging.DEBUG)
 debug_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-
-# Create a filter to ensure the debug handler ONLY gets DEBUG messages from the rotator_library
-class RotatorDebugFilter(logging.Filter):
-    def filter(self, record):
-        return record.levelno == logging.DEBUG and record.name.startswith('rotator_library')
-debug_file_handler.addFilter(RotatorDebugFilter())
-
-# Configure a console handler with color
-console_handler = colorlog.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-formatter = colorlog.ColoredFormatter(
-    '%(log_color)s%(message)s',
-    log_colors={
-        'DEBUG':    'cyan',
-        'INFO':     'green',
-        'WARNING':  'yellow',
-        'ERROR':    'red',
-        'CRITICAL': 'red,bg_white',
-    }
-)
-console_handler.setFormatter(formatter)
-
-# Add a filter to prevent any LiteLLM logs from cluttering the console
-class NoLiteLLMLogFilter(logging.Filter):
-    def filter(self, record):
-        return not record.name.startswith('LiteLLM')
-console_handler.addFilter(NoLiteLLMLogFilter())
-
-# Get the root logger and set it to DEBUG to capture all messages
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.DEBUG)
-
-# Add all handlers to the root logger
-root_logger.addHandler(info_file_handler)
-root_logger.addHandler(console_handler)
+# Filter out raw litellm trace logs from this file
+debug_file_handler.addFilter(lambda record: record.name != 'litellm_trace')
 root_logger.addHandler(debug_file_handler)
 
-# Silence other noisy loggers by setting their level higher than root
+# 5. Dedicated LiteLLM Trace Logger (litellm_trace.log)
+trace_logger = logging.getLogger('litellm_trace')
+trace_logger.setLevel(logging.DEBUG)
+trace_logger.propagate = False # Prevent passing logs to the root logger
+trace_handler = logging.FileHandler(LOG_DIR / "litellm_trace.log", encoding="utf-8")
+trace_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+trace_logger.addHandler(trace_handler)
+
+# Silence other noisy loggers
 logging.getLogger("uvicorn").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-# Isolate LiteLLM's logger to prevent it from reaching the console.
-# We will capture its logs via the logger_fn callback in the client instead.
+# Isolate the main litellm logger; we use our callback to capture its output.
 litellm_logger = logging.getLogger("LiteLLM")
 litellm_logger.handlers = []
 litellm_logger.propagate = False
