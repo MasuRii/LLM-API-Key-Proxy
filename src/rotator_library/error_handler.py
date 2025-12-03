@@ -154,7 +154,24 @@ def get_retry_after(error: Exception) -> Optional[int]:
             except (ValueError, IndexError):
                 continue
 
-    # 3. Handle duration formats like "60s", "2m", "1h"
+    # 3. Handle duration formats like "60s", "2m", "1h", and multi-part "2h39m40s"
+    # First try to parse multi-part durations (e.g., "2h39m40s")
+    multi_part_pattern = r'(?:(\d+)\s*h)?(?:(\d+)\s*m)?(?:(\d+)\s*s)?'
+    multi_match = re.search(multi_part_pattern, error_str, re.IGNORECASE)
+    if multi_match and any(multi_match.groups()):
+        try:
+            hours = int(multi_match.group(1)) if multi_match.group(1) else 0
+            minutes = int(multi_match.group(2)) if multi_match.group(2) else 0
+            seconds = int(multi_match.group(3)) if multi_match.group(3) else 0
+            
+            # Only return if at least one component was found
+            if hours or minutes or seconds:
+                total_seconds = (hours * 3600) + (minutes * 60) + seconds
+                return total_seconds
+        except (ValueError, IndexError):
+            pass
+    
+    # Fallback to single-unit duration format
     duration_match = re.search(r'(\d+)\s*([smh])', error_str)
     if duration_match:
         try:

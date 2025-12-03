@@ -69,20 +69,30 @@ class CredentialManager:
                 match = numbered_pattern.match(key)
                 if match:
                     index = match.group(1)
-                    # Verify refresh token also exists
+                    # Verify both access and refresh tokens exist and are non-empty
+                    access_key = f"{env_prefix}_{index}_ACCESS_TOKEN"
                     refresh_key = f"{env_prefix}_{index}_REFRESH_TOKEN"
-                    if refresh_key in self.env_vars and self.env_vars[refresh_key]:
+                    access_token = self.env_vars.get(access_key, "")
+                    refresh_token = self.env_vars.get(refresh_key, "")
+                    if access_token and access_token.strip() and refresh_token and refresh_token.strip():
                         found_indices.add(index)
+                    elif access_token or refresh_token:
+                        # Log warning if only one is present or if either is empty
+                        lib_logger.warning(f"Skipping incomplete OAuth credential for {env_prefix}_{index}: both ACCESS_TOKEN and REFRESH_TOKEN must be non-empty")
             
             # Check for legacy single credential (PROVIDER_ACCESS_TOKEN pattern)
             # Only use this if no numbered credentials exist
             if not found_indices:
                 access_key = f"{env_prefix}_ACCESS_TOKEN"
                 refresh_key = f"{env_prefix}_REFRESH_TOKEN"
-                if (access_key in self.env_vars and self.env_vars[access_key] and
-                    refresh_key in self.env_vars and self.env_vars[refresh_key]):
+                access_token = self.env_vars.get(access_key, "")
+                refresh_token = self.env_vars.get(refresh_key, "")
+                if access_token and access_token.strip() and refresh_token and refresh_token.strip():
                     # Use "0" as the index for legacy single credential
                     found_indices.add("0")
+                elif access_token or refresh_token:
+                    # Log warning if only one is present or if either is empty
+                    lib_logger.warning(f"Skipping incomplete OAuth credential for {env_prefix}: both ACCESS_TOKEN and REFRESH_TOKEN must be non-empty")
             
             if found_indices:
                 env_credentials[provider] = found_indices

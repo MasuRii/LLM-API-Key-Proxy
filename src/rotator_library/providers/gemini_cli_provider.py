@@ -1811,9 +1811,21 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             if dynamic_count > 0:
                 lib_logger.debug(f"Discovered {dynamic_count} additional models for gemini_cli from API")
 
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                # 403 Forbidden - API is likely not enabled or credentials lack permissions
+                lib_logger.warning(
+                    "Gemini Generative Language API returned 403 Forbidden during model discovery. "
+                    "This likely means the API is not enabled for this project. "
+                    "Falling back to hardcoded model list. "
+                    "To enable: visit https://console.cloud.google.com/apis/library/generativelanguage.googleapis.com"
+                )
+                # Gracefully continue with hardcoded models already added
+            else:
+                # Other HTTP errors - log at debug level
+                lib_logger.debug(f"Dynamic model discovery HTTP error {e.response.status_code}: {e}")
         except Exception as e:
-            # Silently ignore dynamic discovery errors
+            # Silently ignore other dynamic discovery errors
             lib_logger.debug(f"Dynamic model discovery failed for gemini_cli: {e}")
-            pass
 
         return models

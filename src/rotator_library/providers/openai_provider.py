@@ -19,7 +19,7 @@ class OpenAIProvider(ProviderInterface):
         try:
             response = await client.get(
                 "https://api.openai.com/v1/models",
-                headers={"Authorization": f"Bearer {api_key}"}
+                headers=self._make_bearer_header(api_key)
             )
             response.raise_for_status()
             return [f"openai/{model['id']}" for model in response.json().get("data", [])]

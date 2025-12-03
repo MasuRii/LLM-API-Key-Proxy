@@ -683,6 +683,12 @@ class UsageManager:
                 # This ensures the key gets the FULL cooldown even though retry_after=0 for rotation
                 original_delay = getattr(classified_error.original_exception, 'original_retry_delay', None)
                 
+                # Detect quota exhaustion errors (require longer cooldown)
+                error_message = str(classified_error.original_exception).lower()
+                is_quota_error = any(keyword in error_message for keyword in [
+                    'quota', 'daily limit', 'quota exceeded', 'quota exhausted'
+                ])
+                
                 if original_delay:
                     # Use the original delay from Antigravity for key-level cooldown
                     cooldown_seconds = original_delay
@@ -690,8 +696,15 @@ class UsageManager:
                         f"Rate limit error on key {format_credential_for_display(key)} for model {model}. "
                         f"Using original retryDelay for key cooldown: {cooldown_seconds}s"
                     )
+                elif is_quota_error:
+                    # Quota errors need long cooldown (1 hour default) instead of standard rate limit
+                    cooldown_seconds = classified_error.retry_after or 3600  # Default to 1 hour for quota
+                    lib_logger.warning(
+                        f"QUOTA exhaustion detected on key {format_credential_for_display(key)} for model {model}. "
+                        f"Applying long cooldown: {cooldown_seconds}s (retry_after: {classified_error.retry_after})"
+                    )
                 else:
-                    # Standard retry_after or increased default for fail-fast strategy
+                    # Standard rate limit (concurrent): use provided retry_after or shorter default
                     cooldown_seconds = classified_error.retry_after or 300
                     lib_logger.info(
                         f"Rate limit error on key {format_credential_for_display(key)} for model {model}. "

@@ -112,3 +112,27 @@ class ProviderInterface(ABC):
             - gemini-2.5-*: no restriction (None)
         """
         return None
+    
+    def _make_bearer_header(self, token: str) -> Dict[str, str]:
+        """
+        Creates a safe Bearer token header, validating that the token is non-empty.
+        
+        This method prevents the "Illegal header value b'Bearer '" error by raising
+        a ValueError if an empty or whitespace-only token is provided.
+        
+        Args:
+            token: The API key or access token
+            
+        Returns:
+            Dict containing the Authorization header
+            
+        Raises:
+            ValueError: If the token is empty or contains only whitespace
+            
+        Example:
+            >>> header = self._make_bearer_header(api_key)
+            >>> # Returns: {"Authorization": "Bearer sk-..."}
+        """
+        if not token or not token.strip():
+            raise ValueError("Cannot construct Authorization header: token is empty or whitespace")
+        return {"Authorization": f"Bearer {token}"}

@@ -19,7 +19,7 @@ class MistralProvider(ProviderInterface):
         try:
             response = await client.get(
                 "https://api.mistral.ai/v1/models",
-                headers={"Authorization": f"Bearer {api_key}"}
+                headers=self._make_bearer_header(api_key)
             )
             response.raise_for_status()
             return [f"mistral/{model['id']}" for model in response.json().get("data", [])]

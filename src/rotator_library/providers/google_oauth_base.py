@@ -137,8 +137,13 @@ class GoogleOAuthBase:
         access_token = os.getenv(f"{prefix}_ACCESS_TOKEN")
         refresh_token = os.getenv(f"{prefix}_REFRESH_TOKEN")
 
-        # Both access and refresh tokens are required
+        # Both access and refresh tokens are required and must be non-empty
         if not (access_token and refresh_token):
+            return None
+        
+        # Explicit validation: ensure tokens are not just empty strings
+        if not access_token.strip() or not refresh_token.strip():
+            lib_logger.warning(f"{prefix} tokens are empty strings in environment variables")
             return None
 
         lib_logger.debug(f"Loading {prefix} credentials from environment variables")
@@ -377,7 +382,13 @@ class GoogleOAuthBase:
                 raise last_error or Exception("Token refresh failed after all retries")
 
             # [FIX 1] Update OAuth token fields from response
-            creds["access_token"] = new_token_data["access_token"]
+            # Validate access_token is present and non-empty
+            access_token = new_token_data.get("access_token", "")
+            if not access_token or not access_token.strip():
+                lib_logger.error(f"Refresh token response missing or empty access_token for '{Path(path).name}'")
+                raise ValueError("Token refresh returned empty access_token")
+            
+            creds["access_token"] = access_token
             expiry_timestamp = time.time() + new_token_data["expires_in"]
             creds["expiry_date"] = expiry_timestamp * 1000 # gemini-cli format
 
@@ -673,7 +684,14 @@ class GoogleOAuthBase:
         creds = await self._load_credentials(credential_path)
         if self._is_token_expired(creds):
             creds = await self._refresh_token(credential_path, creds)
-        return {"Authorization": f"Bearer {creds['access_token']}"}
+        
+        # Validate token is not empty before constructing header
+        token = creds.get('access_token', '')
+        if not token or not token.strip():
+            lib_logger.error(f"Access token is empty for {credential_path}")
+            raise ValueError("Cannot construct Auth header: Token is empty")
+        
+        return {"Authorization": f"Bearer {token}"}
 
     async def get_user_info(self, creds_or_path: Union[Dict[str, Any], str]) -> Dict[str, Any]:
         path = creds_or_path if isinstance(creds_or_path, str) else None

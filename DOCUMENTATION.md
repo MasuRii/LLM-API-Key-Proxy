@@ -216,6 +216,9 @@ IFLOW_API_KEY
 - The credential behaves exactly like a file-based credential (automatic refresh, expiry detection, etc.)
 - No physical files are created or needed on the host system
 - Perfect for ephemeral containers or read-only filesystems
+- **Strict Validation**: The system now strictly enforces that all token environment variables must be non-empty strings.
+  - **API Keys**: In `main.py`, empty keys (e.g., `OPENAI_API_KEY=""`) are detected at startup, logged as warnings, and excluded from the pool.
+  - **OAuth**: The `CredentialManager` validates that both `ACCESS_TOKEN` and `REFRESH_TOKEN` are present and non-empty. Incomplete pairs are skipped with a warning.
 
 #### 2.6.3. Credential Tool Integration
 
@@ -609,6 +612,17 @@ class AntigravityAuthBase(GoogleOAuthBase):
 
 ---
 
+### 2.13. Advanced Quota Management
+
+The system now distinguishes between short-term rate limits and long-term quota exhaustion to optimize resource usage.
+
+**Key Features:**
+
+1.  **Smart Detection**: The `UsageManager` scans error messages for keywords like "quota", "daily limit", or "exceeded" to identify long-term exhaustion.
+2.  **Complex Duration Parsing**: Support for multi-part duration strings in error messages (e.g., `"2h39m40s"`), ensuring precise cooldowns.
+3.  **Adaptive Cooldowns**:
+    *   **Transient (429)**: Standard backoff (seconds/minutes).
+    *   **Quota Exhaustion**: Long cooldowns (default 1 hour, or parsed duration) to prevent unnecessary retries on exhausted keys.
 
 ---
 
@@ -635,6 +649,10 @@ The provider employs a sophisticated, cached discovery mechanism to find a valid
 2.  **Code Assist API**: Tries `CODE_ASSIST_ENDPOINT:loadCodeAssist`. This returns the project associated with the Cloud Code extension.
 3.  **Onboarding Flow**: If step 2 fails, it triggers the `onboardUser` endpoint. This initiates a Long-Running Operation (LRO) that automatically provisions a free-tier Google Cloud Project for the user. The proxy polls this operation for up to 5 minutes until completion.
 4.  **Resource Manager**: As a final fallback, it lists all active projects via the Cloud Resource Manager API and selects the first one.
+
+#### Graceful Failure Handling (403 Forbidden)
+
+If the "Generative Language API" is not enabled for the detected project, model discovery may fail with a `403 Forbidden`. The provider now catches this specific error, logs an actionable warning with a link to the Google Cloud Console, and automatically falls back to a hardcoded list of default models (e.g., `gemini-2.5-pro`). This prevents the application from crashing due to permission issues.
 
 #### Rate Limit Handling
 
@@ -679,5 +697,34 @@ To facilitate robust debugging, the proxy includes a comprehensive transaction l
     *   `metadata.json`: Performance metrics (duration, token usage, model used).
 
 This level of detail allows developers to trace exactly why a request failed or why a specific key was rotated.
+
+---
+
+## 5. Troubleshooting
+
+### 5.1. Common Errors
+
+#### "Illegal header value b'Bearer '"
+
+This error occurs when the library attempts to make a request using an empty access token.
+
+*   **Cause**: A credential file or environment variable (e.g., `ANTIGRAVITY_ACCESS_TOKEN`) exists but is set to an empty string.
+*   **Resolution**: Ensure all credential environment variables are set to valid, non-empty values.
+    *   **Startup Validation**: The system now strictly filters out empty credentials at startup. If you see warnings like "Skipping empty API key", check your `.env` file or deployment variables.
+    *   **Runtime Safety**: The provider interface now includes a safety check that raises a clear `ValueError` if an empty token is ever attempted to be used, preventing the obscure "Illegal header value" error.
+
+#### "Gemini Generative Language API returned 403 Forbidden"
+
+*   **Cause**: The Google Cloud Project being used does not have the "Generative Language API" (or Cloud Code API) enabled.
+*   **Resolution**:
+    1.  Check the logs for the specific project ID.
+    2.  Visit the URL provided in the warning log (Google Cloud Console).
+    3.  Enable the API for that project.
+    *   *Note*: The system will continue to function using a hardcoded list of models, but dynamic model discovery will be disabled.
+
+#### Frequent 429 Errors (Quota Exhaustion)
+
+*   **Cause**: High volume usage triggering daily limits on specific providers.
+*   **Resolution**: The system automatically detects these "hard" limits and places the specific credential on a long cooldown (up to 24 hours). Check logs for "QUOTA exhaustion detected" messages to see which keys are affected.
 
 

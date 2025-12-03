@@ -299,7 +299,11 @@ for key, value in os.environ.items():
         provider = key.split("_API_KEY")[0].lower()
         if provider not in api_keys:
             api_keys[provider] = []
-        api_keys[provider].append(value)
+        # Filter out empty or whitespace-only API keys
+        if value and value.strip():
+            api_keys[provider].append(value)
+        else:
+            logging.warning(f"Skipping empty API key for environment variable: {key}")
 
 # Load model ignore lists from environment variables
 ignore_models = {}
