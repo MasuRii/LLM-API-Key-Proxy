@@ -139,8 +139,29 @@ class RotatingClient:
         self.max_retries = max_retries
         self.global_timeout = global_timeout
         self.abort_on_callback_error = abort_on_callback_error
+
+        # Build provider rotation modes map
+        # Each provider can specify its preferred rotation mode ("balanced" or "sequential")
+        provider_rotation_modes = {}
+        for provider in self.all_credentials.keys():
+            provider_class = self._provider_plugins.get(provider)
+            if provider_class and hasattr(provider_class, "get_rotation_mode"):
+                # Use class method to get rotation mode (checks env var + class default)
+                mode = provider_class.get_rotation_mode(provider)
+            else:
+                # Fallback: check environment variable directly
+                env_key = f"ROTATION_MODE_{provider.upper()}"
+                mode = os.getenv(env_key, "balanced")
+
+            provider_rotation_modes[provider] = mode
+            if mode != "balanced":
+                lib_logger.info(f"Provider '{provider}' using rotation mode: {mode}")
+
         self.usage_manager = UsageManager(
-            file_path=usage_file_path, rotation_tolerance=rotation_tolerance
+            file_path=usage_file_path,
+            rotation_tolerance=rotation_tolerance,
+            provider_rotation_modes=provider_rotation_modes,
+            provider_plugins=PROVIDER_PLUGINS,
         )
         self._model_list_cache = {}
         self._provider_plugins = PROVIDER_PLUGINS
@@ -447,12 +468,23 @@ class RotatingClient:
 
         Args:
             provider_name: The name of the provider to get an instance for.
+                          For OAuth providers, this may include "_oauth" suffix
+                          (e.g., "antigravity_oauth"), but credentials are stored
+                          under the base name (e.g., "antigravity").
 
         Returns:
             Provider instance if credentials exist, None otherwise.
         """
+        # For OAuth providers, credentials are stored under base name (without _oauth suffix)
+        # e.g., "antigravity_oauth" plugin → credentials under "antigravity"
+        credential_key = provider_name
+        if provider_name.endswith("_oauth"):
+            base_name = provider_name[:-6]  # Remove "_oauth"
+            if base_name in self.oauth_providers:
+                credential_key = base_name
+
         # Only initialize providers for which we have credentials
-        if provider_name not in self.all_credentials:
+        if credential_key not in self.all_credentials:
             lib_logger.debug(
                 f"Skipping provider '{provider_name}' initialization: no credentials configured"
             )
@@ -824,13 +856,20 @@ class RotatingClient:
                         f"Request will likely fail."
                     )
 
-        # Build priority map for usage_manager
+        # Build priority map and tier names map for usage_manager
+        credential_tier_names = None
         if provider_plugin and hasattr(provider_plugin, "get_credential_priority"):
             credential_priorities = {}
+            credential_tier_names = {}
             for cred in credentials_for_provider:
                 priority = provider_plugin.get_credential_priority(cred)
                 if priority is not None:
                     credential_priorities[cred] = priority
+                # Also get tier name for logging
+                if hasattr(provider_plugin, "get_credential_tier_name"):
+                    tier_name = provider_plugin.get_credential_tier_name(cred)
+                    if tier_name:
+                        credential_tier_names[cred] = tier_name
 
             if credential_priorities:
                 lib_logger.debug(
@@ -883,6 +922,7 @@ class RotatingClient:
                     deadline=deadline,
                     max_concurrent=max_concurrent,
                     credential_priorities=credential_priorities,
+                    credential_tier_names=credential_tier_names,
                 )
                 key_acquired = True
                 tried_creds.add(current_cred)
@@ -1051,7 +1091,7 @@ class RotatingClient:
                                 if request
                                 else {},
                             )
-                            classified_error = classify_error(e)
+                            classified_error = classify_error(e, provider=provider)
 
                             # Extract a clean error message for the user-facing log
                             error_message = str(e).split("\n")[0]
@@ -1095,7 +1135,7 @@ class RotatingClient:
                                 if request
                                 else {},
                             )
-                            classified_error = classify_error(e)
+                            classified_error = classify_error(e, provider=provider)
                             error_message = str(e).split("\n")[0]
 
                             # Provider-level error: don't increment consecutive failures
@@ -1151,7 +1191,7 @@ class RotatingClient:
                                 else {},
                             )
 
-                            classified_error = classify_error(e)
+                            classified_error = classify_error(e, provider=provider)
                             error_message = str(e).split("\n")[0]
 
                             lib_logger.warning(
@@ -1220,7 +1260,7 @@ class RotatingClient:
                                 )
                                 raise last_exception
 
-                            classified_error = classify_error(e)
+                            classified_error = classify_error(e, provider=provider)
                             error_message = str(e).split("\n")[0]
 
                             lib_logger.warning(
@@ -1371,13 +1411,20 @@ class RotatingClient:
                         f"Request will likely fail."
                     )
 
-        # Build priority map for usage_manager
+        # Build priority map and tier names map for usage_manager
+        credential_tier_names = None
         if provider_plugin and hasattr(provider_plugin, "get_credential_priority"):
             credential_priorities = {}
+            credential_tier_names = {}
             for cred in credentials_for_provider:
                 priority = provider_plugin.get_credential_priority(cred)
                 if priority is not None:
                     credential_priorities[cred] = priority
+                # Also get tier name for logging
+                if hasattr(provider_plugin, "get_credential_tier_name"):
+                    tier_name = provider_plugin.get_credential_tier_name(cred)
+                    if tier_name:
+                        credential_tier_names[cred] = tier_name
 
             if credential_priorities:
                 lib_logger.debug(
@@ -1433,6 +1480,7 @@ class RotatingClient:
                         deadline=deadline,
                         max_concurrent=max_concurrent,
                         credential_priorities=credential_priorities,
+                        credential_tier_names=credential_tier_names,
                     )
                     key_acquired = True
                     tried_creds.add(current_cred)
@@ -1539,7 +1587,9 @@ class RotatingClient:
                                 last_exception = e
                                 # If the exception is our custom wrapper, unwrap the original error
                                 original_exc = getattr(e, "data", e)
-                                classified_error = classify_error(original_exc)
+                                classified_error = classify_error(
+                                    original_exc, provider=provider
+                                )
                                 error_message = str(original_exc).split("\n")[0]
 
                                 log_failure(
@@ -1596,7 +1646,7 @@ class RotatingClient:
                                     if request
                                     else {},
                                 )
-                                classified_error = classify_error(e)
+                                classified_error = classify_error(e, provider=provider)
                                 error_message = str(e).split("\n")[0]
 
                                 # Provider-level error: don't increment consecutive failures
@@ -1646,7 +1696,7 @@ class RotatingClient:
                                     if request
                                     else {},
                                 )
-                                classified_error = classify_error(e)
+                                classified_error = classify_error(e, provider=provider)
                                 error_message = str(e).split("\n")[0]
 
                                 # Record in accumulator
@@ -1785,7 +1835,9 @@ class RotatingClient:
                             cleaned_str = None
                             # The actual exception might be wrapped in our StreamedAPIError.
                             original_exc = getattr(e, "data", e)
-                            classified_error = classify_error(original_exc)
+                            classified_error = classify_error(
+                                original_exc, provider=provider
+                            )
 
                             # Check if this error should trigger rotation
                             if not should_rotate_on_error(classified_error):
@@ -1912,7 +1964,7 @@ class RotatingClient:
                                 if request
                                 else {},
                             )
-                            classified_error = classify_error(e)
+                            classified_error = classify_error(e, provider=provider)
                             error_message_text = str(e).split("\n")[0]
 
                             # Record error in accumulator (server errors are transient, not abnormal)
@@ -1963,7 +2015,7 @@ class RotatingClient:
                                 if request
                                 else {},
                             )
-                            classified_error = classify_error(e)
+                            classified_error = classify_error(e, provider=provider)
                             error_message_text = str(e).split("\n")[0]
 
                             # Record error in accumulator
@@ -2205,7 +2257,7 @@ class RotatingClient:
                     self._model_list_cache[provider] = final_models
                     return final_models
                 except Exception as e:
-                    classified_error = classify_error(e)
+                    classified_error = classify_error(e, provider=provider)
                     cred_display = mask_credential(credential)
                     lib_logger.debug(
                         f"Failed to get models for provider {provider} with credential {cred_display}: {classified_error.error_type}. Trying next credential."
