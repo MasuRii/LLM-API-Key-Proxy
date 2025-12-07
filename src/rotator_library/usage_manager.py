@@ -72,6 +72,9 @@ class UsageManager:
 
         self._timeout_lock = asyncio.Lock()
         self._claimed_on_timeout: Set[str] = set()
+        
+        # Circuit breaker for disk write failures
+        self._disk_available = True
 
         if daily_reset_time_utc:
             hour, minute = map(int, daily_reset_time_utc.split(":"))
@@ -90,25 +93,64 @@ class UsageManager:
                 self._initialized.set()
 
     async def _load_usage(self):
-        """Loads usage data from the JSON file asynchronously."""
+        """Loads usage data from the JSON file asynchronously with enhanced resilience.
+        
+        [RUNTIME RESILIENCE] Handles various file system errors gracefully,
+        including race conditions where file is deleted between exists check and open.
+        """
         async with self._data_lock:
             if not os.path.exists(self.file_path):
                 self._usage_data = {}
                 return
+
             try:
                 async with aiofiles.open(self.file_path, "r") as f:
                     content = await f.read()
-                    self._usage_data = json.loads(content)
-            except (json.JSONDecodeError, IOError, FileNotFoundError):
+                    self._usage_data = json.loads(content) if content.strip() else {}
+            except FileNotFoundError:
+                # [RACE CONDITION HANDLING] File deleted between exists check and open
                 self._usage_data = {}
+            except json.JSONDecodeError as e:
+                lib_logger.warning(f"Corrupted usage file {self.file_path}: {e}. Starting fresh.")
+                self._usage_data = {}
+            except (OSError, PermissionError, IOError) as e:
+                lib_logger.warning(f"Cannot read usage file {self.file_path}: {e}. Using empty state.")
+                self._usage_data = {}
+            else:
+                # [CIRCUIT BREAKER RESET] Successfully loaded, re-enable disk writes
+                self._disk_available = True
 
     async def _save_usage(self):
-        """Saves the current usage data to the JSON file asynchronously."""
+        """Saves the current usage data to the JSON file asynchronously with resilience.
+        
+        [RUNTIME RESILIENCE] Wraps file operations in try/except to prevent crashes
+        if the file or directory is deleted during runtime. The in-memory state
+        continues to work even if disk persistence fails.
+        """
         if self._usage_data is None:
             return
-        async with self._data_lock:
-            async with aiofiles.open(self.file_path, "w") as f:
-                await f.write(json.dumps(self._usage_data, indent=2))
+        
+        if not self._disk_available:
+            return  # Skip disk write when unavailable
+
+        try:
+            async with self._data_lock:
+                # [DIRECTORY AUTO-RECREATION] Ensure directory exists before write
+                file_dir = os.path.dirname(os.path.abspath(self.file_path))
+                if file_dir and not os.path.exists(file_dir):
+                    os.makedirs(file_dir, exist_ok=True)
+
+                async with aiofiles.open(self.file_path, "w") as f:
+                    await f.write(json.dumps(self._usage_data, indent=2))
+        except (OSError, PermissionError, IOError) as e:
+            # [CIRCUIT BREAKER] Disable disk writes to prevent repeated failures
+            self._disk_available = False
+            # [FAIL SILENTLY, LOG LOUDLY] Log the error but don't crash
+            # In-memory state is preserved and will continue to work
+            lib_logger.warning(
+                f"Failed to save usage data to {self.file_path}: {e}. "
+                "Data will be retained in memory but may be lost on restart."
+            )
 
     async def _reset_daily_stats_if_needed(self):
         """Checks if daily stats need to be reset for any key."""
