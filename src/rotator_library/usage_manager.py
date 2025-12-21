@@ -440,6 +440,25 @@ class UsageManager:
         # Not grouped - return individual model usage (no weight applied)
         return self._get_usage_count(key, model, usage_field)
 
+    def _is_quota_exhausted(self, key: str, model: str) -> bool:
+        """
+        Check if the quota for a specific model on a credential is exhausted.
+        Currently only implemented for request-count based providers (e.g. antigravity).
+        """
+        provider = self._get_provider_from_credential(key)
+        if provider not in self._REQUEST_COUNT_PROVIDERS:
+            return False
+
+        if self._usage_data is None:
+            return False
+
+        key_data = self._usage_data.get(key, {})
+        model_data = key_data.get("models", {}).get(model, {})
+        request_count = model_data.get("request_count", 0)
+        max_requests = model_data.get("quota_max_requests")
+
+        return bool(max_requests and request_count >= max_requests)
+
     def _get_quota_display(self, key: str, model: str) -> str:
         """
         Get a formatted quota display string for logging.
@@ -752,6 +771,10 @@ class UsageManager:
 
                 # Skip if model-specific cooldown is active
                 if (key_data.get("model_cooldowns", {}).get(model) or 0) > now:
+                    continue
+
+                # Skip if quota is exhausted
+                if self._is_quota_exhausted(key, model):
                     continue
 
                 available.append(key)
@@ -1287,6 +1310,10 @@ class UsageManager:
                         ) > now:
                             continue
 
+                        # Skip if quota is exhausted
+                        if self._is_quota_exhausted(key, model):
+                            continue
+
                         # Get priority for this key (default to 999 if not specified)
                         priority = credential_priorities.get(key, 999)
 
@@ -1450,6 +1477,10 @@ class UsageManager:
                         if (key_data.get("key_cooldown_until") or 0) > now or (
                             key_data.get("model_cooldowns", {}).get(model) or 0
                         ) > now:
+                            continue
+
+                        # Skip if quota is exhausted
+                        if self._is_quota_exhausted(key, model):
                             continue
 
                         # Prioritize keys based on their current usage to ensure load balancing.
@@ -2182,6 +2213,14 @@ class UsageManager:
             model_data["baseline_remaining_fraction"] = remaining_fraction
             model_data["baseline_fetched_at"] = now_ts
 
+            # Update reset timestamp if provided
+            if quota_reset_ts:
+                model_data["quota_reset_ts"] = quota_reset_ts
+                # Also set as model cooldown if it's in the future and quota is low
+                if quota_reset_ts > now_ts and remaining_fraction <= 0.001:
+                    model_cooldowns = key_data.setdefault("model_cooldowns", {})
+                    model_cooldowns[model] = quota_reset_ts
+
             # Update max_requests and quota_display
             if max_requests is not None:
                 model_data["quota_max_requests"] = max_requests
@@ -2243,6 +2282,15 @@ class UsageManager:
                         )
                         # Sync request tracking
                         other_model_data["request_count"] = used_requests
+                        if quota_reset_ts:
+                            other_model_data["quota_reset_ts"] = quota_reset_ts
+                            # Also set as model cooldown if it's in the future and quota is low
+                            if quota_reset_ts > now_ts and remaining_fraction <= 0.001:
+                                model_cooldowns = key_data.setdefault(
+                                    "model_cooldowns", {}
+                                )
+                                model_cooldowns[grouped_model] = quota_reset_ts
+
                         if max_requests is not None:
                             other_model_data["quota_max_requests"] = max_requests
                             other_model_data["quota_display"] = (
