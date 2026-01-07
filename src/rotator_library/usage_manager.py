@@ -2245,11 +2245,6 @@ class UsageManager:
             model_data["baseline_remaining_fraction"] = remaining_fraction
             model_data["baseline_fetched_at"] = now_ts
 
-            # Update reset timestamp and set cooldown if quota exhausted
-            self._set_quota_reset_and_cooldown(
-                key_data, model_data, model, quota_reset_ts, now_ts, remaining_fraction
-            )
-
             # Update max_requests and quota_display
             if max_requests is not None:
                 model_data["quota_max_requests"] = max_requests
@@ -2311,14 +2306,6 @@ class UsageManager:
                         )
                         # Sync request tracking
                         other_model_data["request_count"] = used_requests
-                        self._set_quota_reset_and_cooldown(
-                            key_data,
-                            other_model_data,
-                            grouped_model,
-                            quota_reset_ts,
-                            now_ts,
-                            remaining_fraction,
-                        )
 
                         if max_requests is not None:
                             other_model_data["quota_max_requests"] = max_requests
