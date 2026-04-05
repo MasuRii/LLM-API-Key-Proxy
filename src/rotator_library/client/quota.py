@@ -56,7 +56,35 @@ class QuotaService:
             if classifier is not None:
                 stats["classifier"] = classifier
 
-            if stats.get("total_requests", 0) == 0:
+            # Filter out stale quota groups that no longer exist in the provider's
+            # current model_quota_groups (e.g. after a group rename like
+            # firmware_global -> credits($)).
+            plugin = self._get_provider_instance(provider_name)
+            if plugin and hasattr(plugin, "model_quota_groups"):
+                valid_groups = set(plugin.model_quota_groups.keys())
+                if valid_groups:
+                    stale_groups = [
+                        group
+                        for group in stats.get("quota_groups", {})
+                        if group not in valid_groups
+                    ]
+                    for group in stale_groups:
+                        del stats["quota_groups"][group]
+                    for cred_data in stats.get("credentials", {}).values():
+                        for group in stale_groups:
+                            cred_data.get("group_usage", {}).pop(group, None)
+
+            # Skip providers with no activity AND no quota data. This keeps
+            # quota-tracked providers visible even before the first request.
+            has_requests = stats.get("total_requests", 0) > 0
+            has_quota_data = any(
+                any(
+                    window_stats.get("total_max", 0) > 0
+                    for window_stats in group_stats.get("windows", {}).values()
+                )
+                for group_stats in stats.get("quota_groups", {}).values()
+            )
+            if not has_requests and not has_quota_data:
                 continue
 
             providers[manager_key if classifier is not None else provider_name] = stats
