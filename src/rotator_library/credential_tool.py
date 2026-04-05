@@ -23,10 +23,15 @@ from .utils.paths import get_oauth_dir, get_data_file
 from .provider_config import LITELLM_PROVIDERS, PROVIDER_CATEGORIES, PROVIDER_BLACKLIST
 from .litellm_providers import (
     SCRAPED_PROVIDERS,
-    get_provider_api_key_var,
-    get_provider_display_name,
 )
 from .providers.utilities.gemini_shared_utils import format_tier_for_display
+from .providers.utilities.codex_credential_formats import (
+    CODEX_EXPORT_FORMATS,
+    CodexImportResult,
+    import_codex_credentials_from_path,
+    load_codex_credentials_from_directory,
+    write_codex_export_file,
+)
 
 
 def _get_oauth_base_dir() -> Path:
@@ -535,6 +540,11 @@ def _display_provider_credentials(provider_name: str):
     if provider_name == "gemini_cli":
         table.add_column("Tier", style="green")
         table.add_column("Project", style="dim")
+    elif provider_name == "codex":
+        table.add_column("Workspace", style="green")
+        table.add_column("Plan", style="magenta")
+        table.add_column("Account ID", style="dim")
+
     for i, cred in enumerate(credentials, 1):
         file_name = Path(cred["file_path"]).name
         email = cred.get("email", "unknown")
@@ -545,6 +555,13 @@ def _display_provider_credentials(provider_name: str):
             if project and len(project) > 20:
                 project = project[:17] + "..."
             table.add_row(str(i), file_name, email, tier or "-", project or "-")
+        elif provider_name == "codex":
+            workspace = cred.get("workspace_title", "-") or "-"
+            plan = cred.get("plan_type", "-") or "-"
+            account_id = cred.get("account_id", "-") or "-"
+            if account_id and len(account_id) > 12 and account_id != "-":
+                account_id = account_id[:8] + "..."
+            table.add_row(str(i), file_name, email, workspace, plan, account_id)
         else:
             table.add_row(str(i), file_name, email)
 
@@ -775,6 +792,11 @@ async def _view_oauth_credentials_detail(provider_name: str):
     if provider_name == "gemini_cli":
         table.add_column("Tier", style="green")
         table.add_column("Project", style="dim")
+    elif provider_name == "codex":
+        table.add_column("Workspace", style="green")
+        table.add_column("Plan", style="magenta")
+        table.add_column("Account ID", style="dim")
+
     for i, cred in enumerate(credentials, 1):
         file_name = Path(cred["file_path"]).name
         email = cred.get("email", "unknown")
@@ -787,6 +809,13 @@ async def _view_oauth_credentials_detail(provider_name: str):
             if project and len(project) > 25:
                 project = project[:22] + "..."
             table.add_row(str(i), file_name, email, tier, project or "-")
+        elif provider_name == "codex":
+            workspace = cred.get("workspace_title", "-") or "-"
+            plan = cred.get("plan_type", "-") or "-"
+            account_id = cred.get("account_id", "-") or "-"
+            if account_id and len(account_id) > 12 and account_id != "-":
+                account_id = account_id[:8] + "..."
+            table.add_row(str(i), file_name, email, workspace, plan, account_id)
         else:
             table.add_row(str(i), file_name, email)
 
@@ -1181,7 +1210,6 @@ async def setup_api_key():
     # -------------------------------------------------------------------------
     _, PROVIDER_PLUGINS = _ensure_providers_loaded()
     from .providers import DynamicOpenAICompatibleProvider
-    from .providers.provider_interface import ProviderInterface
 
     # Build a set of API key env vars already in SCRAPED_PROVIDERS
     litellm_api_keys = set()
@@ -1733,6 +1761,25 @@ async def setup_new_credential(provider_name: str):
                 f"for user [bold cyan]'{result.email}'[/bold cyan]."
             )
 
+        # Add workspace/account info if available (OpenAI Codex credentials)
+        if result.credentials and isinstance(result.credentials, dict):
+            metadata = result.credentials.get("_proxy_metadata", {})
+            workspace_title = metadata.get("workspace_title")
+            plan_type = metadata.get("plan_type")
+            if workspace_title or plan_type:
+                workspace_parts = []
+                if workspace_title:
+                    workspace_parts.append(workspace_title)
+                if plan_type:
+                    workspace_parts.append(f"({plan_type})")
+                success_text.append(
+                    f"\nWorkspace: {' '.join(workspace_parts)}"
+                )
+            if result.account_id:
+                success_text.append(
+                    f"\nAccount ID: {result.account_id}"
+                )
+
         # Add tier/project info if available (Google OAuth providers)
         if hasattr(result, "tier") and result.tier:
             # Try to get the full tier name for better display (e.g., "Google One AI PRO")
@@ -1829,6 +1876,194 @@ async def export_gemini_cli_to_env():
                     f"1. Copy the contents to your main .env file, OR\n"
                     f"2. Source it: [bold cyan]source {Path(env_path).name}[/bold cyan] (Linux/Mac)\n"
                     f"3. Or on Windows: [bold cyan]Get-Content {Path(env_path).name} | ForEach-Object {{ $_ -replace '^([^#].*)$', 'set $1' }} | cmd[/bold cyan]\n\n"
+                    f"[bold]To combine multiple credentials:[/bold]\n"
+                    f"Copy lines from multiple .env files into one file.\n"
+                    f"Each credential uses a unique number ({numbered_prefix}_*)."
+                )
+                console.print(Panel(success_text, style="bold green", title="Success"))
+            else:
+                console.print(
+                    Panel(
+                        "Failed to export credential", style="bold red", title="Error"
+                    )
+                )
+        else:
+            console.print("[bold red]Invalid choice. Please try again.[/bold red]")
+    except ValueError:
+        console.print(
+            "[bold red]Invalid input. Please enter a number or 'b'.[/bold red]"
+        )
+    except Exception as e:
+        console.print(
+            Panel(
+                f"An error occurred during export: {e}", style="bold red", title="Error"
+            )
+        )
+
+
+async def export_codex_to_env():
+    """
+    Export a Codex credential JSON file to .env format.
+    Uses the auth class's build_env_lines() and list_credentials() methods.
+    """
+    clear_screen("Export Codex Credential")
+
+    # Get auth instance for this provider
+    provider_factory, _ = _ensure_providers_loaded()
+    auth_class = provider_factory.get_provider_auth_class("codex")
+    auth_instance = auth_class()
+
+    # List available credentials using auth class
+    credentials = auth_instance.list_credentials(_get_oauth_base_dir())
+
+    if not credentials:
+        console.print(
+            Panel(
+                "No Codex credentials found. Please add one first using 'Add OAuth Credential'.",
+                style="bold red",
+                title="No Credentials",
+            )
+        )
+        return
+
+    # Display available credentials
+    cred_text = Text()
+    for i, cred_info in enumerate(credentials):
+        cred_text.append(
+            f"  {i + 1}. {Path(cred_info['file_path']).name} ({cred_info['email']})\n"
+        )
+
+    console.print(
+        Panel(
+            cred_text,
+            title="Available Codex Credentials",
+            style="bold blue",
+        )
+    )
+
+    choice = Prompt.ask(
+        Text.from_markup(
+            "[bold]Please select a credential to export or type [red]'b'[/red] to go back[/bold]"
+        ),
+        choices=[str(i + 1) for i in range(len(credentials))] + ["b"],
+        show_choices=False,
+    )
+
+    if choice.lower() == "b":
+        return
+
+    try:
+        choice_index = int(choice) - 1
+        if 0 <= choice_index < len(credentials):
+            cred_info = credentials[choice_index]
+
+            # Use auth class to export
+            env_path = auth_instance.export_credential_to_env(
+                cred_info["file_path"], _get_oauth_base_dir()
+            )
+
+            if env_path:
+                numbered_prefix = f"CODEX_{cred_info['number']}"
+                success_text = Text.from_markup(
+                    f"Successfully exported credential to [bold yellow]'{Path(env_path).name}'[/bold yellow]\n\n"
+                    f"[bold]Environment variable prefix:[/bold] [cyan]{numbered_prefix}_*[/cyan]\n\n"
+                    f"[bold]To use this credential:[/bold]\n"
+                    f"1. Copy the contents to your main .env file, OR\n"
+                    f"2. Source it: [bold cyan]source {Path(env_path).name}[/bold cyan] (Linux/Mac)\n\n"
+                    f"[bold]To combine multiple credentials:[/bold]\n"
+                    f"Copy lines from multiple .env files into one file.\n"
+                    f"Each credential uses a unique number ({numbered_prefix}_*)."
+                )
+                console.print(Panel(success_text, style="bold green", title="Success"))
+            else:
+                console.print(
+                    Panel(
+                        "Failed to export credential", style="bold red", title="Error"
+                    )
+                )
+        else:
+            console.print("[bold red]Invalid choice. Please try again.[/bold red]")
+    except ValueError:
+        console.print(
+            "[bold red]Invalid input. Please enter a number or 'b'.[/bold red]"
+        )
+    except Exception as e:
+        console.print(
+            Panel(
+                f"An error occurred during export: {e}", style="bold red", title="Error"
+            )
+        )
+
+
+async def export_anthropic_to_env():
+    """
+    Export an Anthropic credential JSON file to .env format.
+    Uses the auth class's build_env_lines() and list_credentials() methods.
+    """
+    clear_screen("Export Anthropic Credential")
+
+    # Get auth instance for this provider
+    provider_factory, _ = _ensure_providers_loaded()
+    auth_class = provider_factory.get_provider_auth_class("anthropic")
+    auth_instance = auth_class()
+
+    # List available credentials using auth class
+    credentials = auth_instance.list_credentials(_get_oauth_base_dir())
+
+    if not credentials:
+        console.print(
+            Panel(
+                "No Anthropic credentials found. Please add one first using 'Add OAuth Credential'.",
+                style="bold red",
+                title="No Credentials",
+            )
+        )
+        return
+
+    # Display available credentials
+    cred_text = Text()
+    for i, cred_info in enumerate(credentials):
+        cred_text.append(
+            f"  {i + 1}. {Path(cred_info['file_path']).name} ({cred_info['email']})\n"
+        )
+
+    console.print(
+        Panel(
+            cred_text,
+            title="Available Anthropic Credentials",
+            style="bold blue",
+        )
+    )
+
+    choice = Prompt.ask(
+        Text.from_markup(
+            "[bold]Please select a credential to export or type [red]'b'[/red] to go back[/bold]"
+        ),
+        choices=[str(i + 1) for i in range(len(credentials))] + ["b"],
+        show_choices=False,
+    )
+
+    if choice.lower() == "b":
+        return
+
+    try:
+        choice_index = int(choice) - 1
+        if 0 <= choice_index < len(credentials):
+            cred_info = credentials[choice_index]
+
+            # Use auth class to export
+            env_path = auth_instance.export_credential_to_env(
+                cred_info["file_path"], _get_oauth_base_dir()
+            )
+
+            if env_path:
+                numbered_prefix = f"ANTHROPIC_OAUTH_{cred_info['number']}"
+                success_text = Text.from_markup(
+                    f"Successfully exported credential to [bold yellow]'{Path(env_path).name}'[/bold yellow]\n\n"
+                    f"[bold]Environment variable prefix:[/bold] [cyan]{numbered_prefix}_*[/cyan]\n\n"
+                    f"[bold]To use this credential:[/bold]\n"
+                    f"1. Copy the contents to your main .env file, OR\n"
+                    f"2. Source it: [bold cyan]source {Path(env_path).name}[/bold cyan] (Linux/Mac)\n\n"
                     f"[bold]To combine multiple credentials:[/bold]\n"
                     f"Copy lines from multiple .env files into one file.\n"
                     f"Each credential uses a unique number ({numbered_prefix}_*)."
@@ -2018,7 +2253,7 @@ async def combine_all_credentials():
     clear_screen("Combine All Credentials")
 
     # List of providers that support OAuth credentials
-    oauth_providers = ["gemini_cli"]
+    oauth_providers = ["gemini_cli", "codex", "anthropic"]
 
     provider_factory, _ = _ensure_providers_loaded()
 
@@ -2108,6 +2343,201 @@ async def combine_all_credentials():
     )
 
 
+def _clean_prompt_path(value: str) -> str:
+    """Normalize a path pasted into the interactive credential tool."""
+    return value.strip().strip('"').strip("'")
+
+
+def _parse_prompt_paths(value: str) -> list[str]:
+    """Parse newline/comma/semicolon-separated paths, respecting quotes."""
+    paths: list[str] = []
+    seen: set[str] = set()
+    current: list[str] = []
+    quote: str | None = None
+
+    def append_current() -> None:
+        raw_path = "".join(current)
+        current.clear()
+        path = _clean_prompt_path(raw_path)
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+
+    for char in value:
+        if char in {'"', "'"}:
+            if quote == char:
+                quote = None
+            elif quote is None:
+                quote = char
+            current.append(char)
+            continue
+
+        if quote is None and char in {"\n", "\r", ",", ";"}:
+            append_current()
+            continue
+
+        current.append(char)
+
+    append_current()
+    return paths
+
+
+def _read_codex_import_paths() -> list[str]:
+    """Read one or more Codex import paths from the terminal."""
+    console.print(
+        Text.from_markup(
+            "[bold]Paste import file/folder path(s).[/bold]\n"
+            "Use one path per line, or separate paths with commas/semicolons.\n"
+            "Quoted paths are supported. Submit a blank line to start import; type [red]b[/red] to go back."
+        )
+    )
+
+    lines: list[str] = []
+    while True:
+        line = input("> " if not lines else "  ")
+        if not lines and line.strip().lower() == "b":
+            return []
+        if not line.strip():
+            break
+        lines.append(line)
+
+    return _parse_prompt_paths("\n".join(lines))
+
+
+def _merge_codex_import_result(target: CodexImportResult, partial: CodexImportResult) -> None:
+    target.imported += partial.imported
+    target.updated += partial.updated
+    target.skipped += partial.skipped
+    target.errors.extend(partial.errors)
+    target.written_paths.extend(partial.written_paths)
+
+
+async def import_codex_json_credentials():
+    """Import Codex credentials from GPTSession2CPA/sub2api/Codex-Manager JSON."""
+    clear_screen("Import Codex Credentials")
+    console.print(
+        Panel(
+            Text.from_markup(
+                "Paste a JSON/JSONL file or folder exported by GPTSession2CPAandSub2API,\n"
+                "CodexAccountStatusQuotaChecker, Sub2API, CPA, Cockpit, 9router,\n"
+                "Codex auth.json, AxonHub, or Codex-Manager.\n\n"
+                "The proxy will write one [yellow]codex_oauth_*.json[/yellow] file per account."
+            ),
+            title="Supported Codex Import Formats",
+            style="bold blue",
+        )
+    )
+
+    import_paths = _read_codex_import_paths()
+    if not import_paths:
+        console.print("[bold yellow]No import paths provided.[/bold yellow]")
+        return
+
+    update_existing = Confirm.ask(
+        "Update matching existing Codex credentials if found?",
+        default=True,
+    )
+
+    result = CodexImportResult()
+    for import_path in import_paths:
+        partial = import_codex_credentials_from_path(
+            import_path,
+            _get_oauth_base_dir(),
+            update_existing=update_existing,
+        )
+        _merge_codex_import_result(result, partial)
+
+    summary = (
+        f"Imported: {result.imported}\n"
+        f"Updated: {result.updated}\n"
+        f"Skipped/errors: {result.skipped}\n"
+        f"Output directory: {_get_oauth_base_dir()}"
+    )
+    console.print(
+        Panel(
+            summary,
+            style="bold green" if result.total_written else "bold yellow",
+            title="Codex Import Complete",
+        )
+    )
+
+    if result.written_paths:
+        table = Table(title="Written Credentials", box=None, padding=(0, 2))
+        table.add_column("#", style="dim", width=4)
+        table.add_column("Path", style="yellow")
+        for index, path in enumerate(result.written_paths[:20], start=1):
+            table.add_row(str(index), path)
+        console.print(table)
+        if len(result.written_paths) > 20:
+            console.print(f"[dim]...and {len(result.written_paths) - 20} more[/dim]")
+
+    if result.errors:
+        error_text = "\n".join(result.errors[:10])
+        if len(result.errors) > 10:
+            error_text += f"\n...and {len(result.errors) - 10} more"
+        console.print(Panel(error_text, style="bold red", title="Import Warnings"))
+
+
+async def export_codex_json_credentials():
+    """Export Codex credentials to GPTSession2CPA/sub2api-compatible JSON."""
+    clear_screen("Export Codex JSON Formats")
+    credentials = load_codex_credentials_from_directory(_get_oauth_base_dir())
+    if not credentials:
+        console.print(
+            Panel(
+                "No Codex credentials found. Add or import Codex credentials first.",
+                style="bold red",
+                title="No Credentials",
+            )
+        )
+        return
+
+    table = Table(title="Supported Codex Export Formats", box=None, padding=(0, 2))
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Format", style="cyan")
+    table.add_column("Description", style="white")
+    for index, format_info in enumerate(CODEX_EXPORT_FORMATS, start=1):
+        table.add_row(str(index), format_info.label, format_info.description)
+    console.print(table)
+
+    choice = Prompt.ask(
+        Text.from_markup("[bold]Select export format or type [red]'b'[/red] to go back[/bold]"),
+        choices=[str(i) for i in range(1, len(CODEX_EXPORT_FORMATS) + 1)] + ["b"],
+        show_choices=False,
+    )
+    if choice.lower() == "b":
+        return
+
+    format_info = CODEX_EXPORT_FORMATS[int(choice) - 1]
+    timestamp = time.strftime("%Y%m%d%H%M%S")
+    default_path = _get_oauth_base_dir() / f"codex-{format_info.id}-{timestamp}{format_info.extension}"
+    raw_output = Prompt.ask(
+        Text.from_markup("[bold]Output file path[/bold]"),
+        default=str(default_path),
+    )
+    output_path = Path(_clean_prompt_path(raw_output))
+    if not output_path.suffix:
+        output_path = output_path.with_suffix(format_info.extension)
+
+    try:
+        written = write_codex_export_file(output_path, credentials, format_info.id)
+    except Exception as exc:
+        console.print(Panel(str(exc), style="bold red", title="Export Failed"))
+        return
+
+    console.print(
+        Panel(
+            Text.from_markup(
+                f"Exported [bold cyan]{len(credentials)}[/bold cyan] Codex credential(s)\n"
+                f"Format: [bold]{format_info.label}[/bold]\n"
+                f"Output: [yellow]{written}[/yellow]"
+            ),
+            style="bold green",
+            title="Codex Export Complete",
+        )
+    )
+
+
 async def export_credentials_submenu():
     """
     Submenu for credential export options.
@@ -2120,13 +2550,22 @@ async def export_credentials_submenu():
                 Text.from_markup(
                     "[bold]Individual Exports:[/bold]\n"
                     "1. Export Gemini CLI credential\n"
+                    "2. Export Codex credential\n"
+                    "3. Export Anthropic credential\n"
                     "\n"
                     "[bold]Bulk Exports (per provider):[/bold]\n"
-                    "2. Export ALL Gemini CLI credentials\n"
+                    "4. Export ALL Gemini CLI credentials\n"
+                    "5. Export ALL Codex credentials\n"
+                    "6. Export ALL Anthropic credentials\n"
                     "\n"
                     "[bold]Combine Credentials:[/bold]\n"
-                    "3. Combine all Gemini CLI into one file\n"
-                    "4. Combine ALL providers into one file"
+                    "7. Combine all Gemini CLI into one file\n"
+                    "8. Combine all Codex into one file\n"
+                    "9. Combine all Anthropic into one file\n"
+                    "10. Combine ALL providers into one file\n"
+                    "\n"
+                    "[bold]Codex JSON Formats:[/bold]\n"
+                    "11. Export ALL Codex to CPA/sub2api/Codex-Manager JSON"
                 ),
                 title="Choose export option",
                 style="bold blue",
@@ -2138,10 +2577,8 @@ async def export_credentials_submenu():
                 "[bold]Please select an option or type [red]'b'[/red] to go back[/bold]"
             ),
             choices=[
-                "1",
-                "2",
-                "3",
-                "4",
+                "1", "2", "3", "4", "5", "6",
+                "7", "8", "9", "10", "11",
                 "b",
             ],
             show_choices=False,
@@ -2155,19 +2592,47 @@ async def export_credentials_submenu():
             await export_gemini_cli_to_env()
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
-        # Bulk exports (all credentials for a provider)
         elif export_choice == "2":
+            await export_codex_to_env()
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "3":
+            await export_anthropic_to_env()
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        # Bulk exports (all credentials for a provider)
+        elif export_choice == "4":
             await export_all_provider_credentials("gemini_cli")
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
+        elif export_choice == "5":
+            await export_all_provider_credentials("codex")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "6":
+            await export_all_provider_credentials("anthropic")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
         # Combine per provider
-        elif export_choice == "3":
+        elif export_choice == "7":
             await combine_provider_credentials("gemini_cli")
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
+        elif export_choice == "8":
+            await combine_provider_credentials("codex")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "9":
+            await combine_provider_credentials("anthropic")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
         # Combine all providers
-        elif export_choice == "4":
+        elif export_choice == "10":
             await combine_all_credentials()
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "11":
+            await export_codex_json_credentials()
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
 
@@ -2201,7 +2666,8 @@ async def main(clear_on_start=True):
                     "3. Add Custom OpenAI-Compatible Provider\n"
                     "4. Export Credentials\n"
                     "5. View Credentials\n"
-                    "6. Manage Credentials"
+                    "6. Manage Credentials\n"
+                    "7. Import Codex JSON/JSONL Credentials"
                 ),
                 title="Choose action",
                 style="bold blue",
@@ -2212,7 +2678,7 @@ async def main(clear_on_start=True):
             Text.from_markup(
                 "[bold]Please select an option or type [red]'q'[/red] to quit[/bold]"
             ),
-            choices=["1", "2", "3", "4", "5", "6", "q"],
+            choices=["1", "2", "3", "4", "5", "6", "7", "q"],
             show_choices=False,
         )
 
@@ -2298,6 +2764,11 @@ async def main(clear_on_start=True):
 
         elif setup_type == "6":
             await manage_credentials_submenu()
+
+        elif setup_type == "7":
+            await import_codex_json_credentials()
+            console.print("\n[dim]Press Enter to return to main menu...[/dim]")
+            input()
 
 
 def run_credential_tool(from_launcher=False):

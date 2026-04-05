@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Union
 
 from .utils.paths import get_oauth_dir
+from .providers.utilities.codex_credential_formats import (
+    parse_codex_credentials_from_file,
+    write_codex_credentials_to_directory,
+)
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -87,6 +91,18 @@ class CredentialManager:
                     if refresh_key in self.env_vars and self.env_vars[refresh_key]:
                         found_indices.add(index)
 
+            # For Codex provider, also check for API_KEY-only credentials
+            # Codex can exchange OAuth tokens for persistent API keys, so
+            # CODEX_N_API_KEY alone (without a refresh token) is valid
+            if provider == "codex":
+                api_key_pattern = re.compile(rf"^{env_prefix}_(\d+)_API_KEY$")
+                for key in self.env_vars.keys():
+                    match = api_key_pattern.match(key)
+                    if match:
+                        index = match.group(1)
+                        if index not in found_indices and self.env_vars[key]:
+                            found_indices.add(index)
+
             # Check for legacy single credential (PROVIDER_ACCESS_TOKEN pattern)
             # Only use this if no numbered credentials exist
             if not found_indices:
@@ -100,6 +116,12 @@ class CredentialManager:
                 ):
                     # Use "0" as the index for legacy single credential
                     found_indices.add("0")
+
+                # For Codex, also accept legacy API_KEY-only format
+                if not found_indices and provider == "codex":
+                    api_key = f"{env_prefix}_API_KEY"
+                    if api_key in self.env_vars and self.env_vars[api_key]:
+                        found_indices.add("0")
 
             if found_indices:
                 env_credentials[provider] = found_indices
@@ -141,24 +163,36 @@ class CredentialManager:
 
         # PHASE 2: Discover file-based OAuth credentials
         for provider, default_dir in DEFAULT_OAUTH_DIRS.items():
-            # Skip if already discovered from environment variables
-            if provider in final_config:
-                lib_logger.debug(
-                    f"Skipping file discovery for {provider} - using env-based credentials"
-                )
-                continue
-
-            # Check for existing local credentials first. If found, use them and skip discovery.
+            # Existing local credentials are always usable. If env credentials also
+            # exist, include both pools instead of hiding imported local files.
             local_provider_creds = sorted(
                 list(self.oauth_base_dir.glob(f"{provider}_oauth_*.json"))
             )
             if local_provider_creds:
-                lib_logger.info(
-                    f"Found {len(local_provider_creds)} existing local credential(s) for {provider}. Skipping discovery."
+                local_paths = [str(p.resolve()) for p in local_provider_creds]
+                if provider in final_config:
+                    existing = set(final_config[provider])
+                    final_config[provider].extend(
+                        path for path in local_paths if path not in existing
+                    )
+                    lib_logger.info(
+                        f"Found {len(local_provider_creds)} existing local credential(s) "
+                        f"for {provider}; using them alongside env-based credentials."
+                    )
+                else:
+                    lib_logger.info(
+                        f"Found {len(local_provider_creds)} existing local credential(s) "
+                        f"for {provider}. Skipping discovery."
+                    )
+                    final_config[provider] = local_paths
+                continue
+
+            # If env credentials exist but no local files do, keep stateless env-only
+            # behavior and skip one-time file copy/discovery.
+            if provider in final_config:
+                lib_logger.debug(
+                    f"Skipping file discovery for {provider} - using env-based credentials"
                 )
-                final_config[provider] = [
-                    str(p.resolve()) for p in local_provider_creds
-                ]
                 continue
 
             # If no local credentials exist, proceed with a one-time discovery and copy.
@@ -188,6 +222,25 @@ class CredentialManager:
                 local_path = self.oauth_base_dir / local_filename
 
                 try:
+                    # Codex supports several third-party/session export formats. Normalize
+                    # those into one proxy-native codex_oauth_*.json file per account.
+                    if provider == "codex":
+                        credentials = parse_codex_credentials_from_file(source_path)
+                        result = write_codex_credentials_to_directory(
+                            credentials,
+                            self.oauth_base_dir,
+                            update_existing=True,
+                        )
+                        if result.total_written:
+                            lib_logger.info(
+                                f"Imported {result.total_written} Codex credential(s) "
+                                f"from '{source_path.name}' into the local pool."
+                            )
+                            prepared_paths.extend(result.written_paths)
+                            for error in result.errors:
+                                lib_logger.warning(f"Codex import warning: {error}")
+                            continue
+
                     # Since we've established no local files exist, we can copy directly.
                     shutil.copy(source_path, local_path)
                     lib_logger.info(
