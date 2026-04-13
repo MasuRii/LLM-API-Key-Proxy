@@ -133,6 +133,7 @@ cache/antigravity/thought_signatures.json
 /oauth_creds/
 
 /usage/
+.agent/
 
 # Keep classifier-scoped routing regression tests reviewable even when a local
 # exclude file ignores the tests directory, without surfacing unrelated tests.

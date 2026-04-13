@@ -89,52 +89,65 @@ class QuotaService:
 
             providers[manager_key if classifier is not None else provider_name] = stats
 
-        summary = {
-            "total_providers": len(providers),
-            "total_credentials": 0,
-            "active_credentials": 0,
-            "exhausted_credentials": 0,
-            "total_requests": 0,
-            "tokens": {
-                "input_cached": 0,
-                "input_uncached": 0,
-                "input_cache_pct": 0,
-                "output": 0,
-            },
-            "approx_total_cost": None,
-        }
+        def _build_summary(
+            providers_data: Dict[str, Any], source_key: Optional[str] = None
+        ) -> Dict[str, Any]:
+            summary = {
+                "total_providers": len(providers_data),
+                "total_credentials": 0,
+                "active_credentials": 0,
+                "exhausted_credentials": 0,
+                "total_requests": 0,
+                "tokens": {
+                    "input_cached": 0,
+                    "input_uncached": 0,
+                    "input_cache_pct": 0,
+                    "output": 0,
+                },
+                "approx_total_cost": None,
+            }
 
-        for prov in providers.values():
-            summary["total_credentials"] += prov.get("credential_count", 0)
-            summary["active_credentials"] += prov.get("active_count", 0)
-            summary["exhausted_credentials"] += prov.get("exhausted_count", 0)
-            summary["total_requests"] += prov.get("total_requests", 0)
-            tokens = prov.get("tokens", {})
-            summary["tokens"]["input_cached"] += tokens.get("input_cached", 0)
-            summary["tokens"]["input_uncached"] += tokens.get("input_uncached", 0)
-            summary["tokens"]["output"] += tokens.get("output", 0)
+            approx_total_cost = 0.0
+            has_cost = False
+            for prov in providers_data.values():
+                summary["total_credentials"] += prov.get("credential_count", 0)
+                summary["active_credentials"] += prov.get("active_count", 0)
+                summary["exhausted_credentials"] += prov.get("exhausted_count", 0)
 
-        total_input = (
-            summary["tokens"]["input_cached"] + summary["tokens"]["input_uncached"]
-        )
-        summary["tokens"]["input_cache_pct"] = (
-            round(summary["tokens"]["input_cached"] / total_input * 100, 1)
-            if total_input > 0
-            else 0
-        )
+                if source_key:
+                    source = prov.get(source_key, {})
+                    summary["total_requests"] += source.get("total_requests", 0)
+                    tokens = source.get("tokens", {})
+                    cost = source.get("approx_cost")
+                else:
+                    summary["total_requests"] += prov.get("total_requests", 0)
+                    tokens = prov.get("tokens", {})
+                    cost = prov.get("approx_cost")
 
-        approx_total_cost = 0.0
-        has_cost = False
-        for prov in providers.values():
-            cost = prov.get("approx_cost")
-            if cost:
-                approx_total_cost += cost
-                has_cost = True
-        summary["approx_total_cost"] = approx_total_cost if has_cost else None
+                summary["tokens"]["input_cached"] += tokens.get("input_cached", 0)
+                summary["tokens"]["input_uncached"] += tokens.get("input_uncached", 0)
+                summary["tokens"]["output"] += tokens.get("output", 0)
+
+                if cost:
+                    approx_total_cost += cost
+                    has_cost = True
+
+            total_input = (
+                summary["tokens"]["input_cached"]
+                + summary["tokens"]["input_uncached"]
+            )
+            summary["tokens"]["input_cache_pct"] = (
+                round(summary["tokens"]["input_cached"] / total_input * 100, 1)
+                if total_input > 0
+                else 0
+            )
+            summary["approx_total_cost"] = approx_total_cost if has_cost else None
+            return summary
 
         return {
             "providers": providers,
-            "summary": summary,
+            "summary": _build_summary(providers, source_key="current_period"),
+            "global_summary": _build_summary(providers),
             "data_source": "cache",
             "timestamp": time.time(),
         }
