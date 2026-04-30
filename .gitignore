@@ -134,6 +134,7 @@ cache/antigravity/thought_signatures.json
 
 /usage/
 .agent/
+.private/
 
 # Keep classifier-scoped routing regression tests reviewable even when a local
 # exclude file ignores the tests directory, without surfacing unrelated tests.
