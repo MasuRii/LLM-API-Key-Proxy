@@ -3,11 +3,10 @@
 
 from typing import TYPE_CHECKING, Dict, Type
 
-from .client import RotatingClient
-
 # For type checkers (Pylint, mypy), import PROVIDER_PLUGINS statically
 # At runtime, it's lazy-loaded via __getattr__
 if TYPE_CHECKING:
+    from .client import RotatingClient
     from .providers import PROVIDER_PLUGINS
     from .providers.provider_interface import ProviderInterface
     from .model_info_service import ModelInfoService, ModelInfo, ModelMetadata
@@ -45,4 +44,8 @@ def __getattr__(name):
         from . import anthropic_compat
 
         return anthropic_compat
+    if name == "RotatingClient":
+        from .client import RotatingClient
+
+        return RotatingClient
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

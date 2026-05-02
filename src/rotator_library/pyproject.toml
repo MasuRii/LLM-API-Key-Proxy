@@ -23,4 +23,4 @@ dependencies = []
 "Bug Tracker" = "https://github.com/Mirrowel/LLM-API-Key-Proxy/issues"
 
 [tool.setuptools.packages]
-find = { where = ["."], include = ["rotator_library*"] }
+find = { where = [".."], include = ["rotator_library*"] }
