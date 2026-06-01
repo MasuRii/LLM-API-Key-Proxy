@@ -141,6 +141,9 @@ cache/antigravity/thought_signatures.json
 webui/node_modules/
 webui/dist/
 
+# Command Code session files
+command_code_cookies.json
+
 # Keep classifier-scoped routing regression tests reviewable even when a local
 # exclude file ignores the tests directory, without surfacing unrelated tests.
 !tests/
