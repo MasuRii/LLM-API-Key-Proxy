@@ -53,6 +53,13 @@ NANOGPT_API_BASE = "https://nano-gpt.com"
 # Concurrency limit for parallel quota fetches
 QUOTA_FETCH_CONCURRENCY = 5
 
+# Minimum remaining tokens before treating quota as effectively exhausted.
+# At < 250K tokens remaining on a 60M weekly budget, most requests will fail
+# mid-stream anyway, so proactively mark the credential as exhausted.
+NANOGPT_EXHAUSTION_TOKEN_THRESHOLD = int(
+    os.getenv("NANOGPT_EXHAUSTION_TOKEN_THRESHOLD", "250000")
+)
+
 # Model discovery endpoint mapping
 # Controlled by NANOGPT_MODEL_SOURCE env var
 # Endpoints support ?detailed=true for full metadata (context_length, pricing, etc.)
@@ -160,8 +167,56 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
     }
     default_tier_priority = 3
 
-    # Quota groups for tracking weekly input tokens
-    # These are virtual models used to track subscription-level quota
+    @staticmethod
+    def parse_quota_error(
+        error: Exception, error_body: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Parse NanoGPT-specific quota/rate-limit errors.
+
+        NanoGPT 429 responses indicate subscription quota exhaustion when
+        they mention usage limits, balance, or subscription caps.
+        Any 429 from NanoGPT that isn't clearly a short-term rate limit
+        (per-minute/per-second) is treated as quota exhaustion since
+        NanoGPT's rate limiting is primarily subscription-based.
+        """
+        body = error_body
+        if not body:
+            if hasattr(error, "response") and hasattr(error.response, "text"):
+                body = error.response.text
+            elif hasattr(error, "body"):
+                body = str(error.body) if not isinstance(error.body, str) else error.body
+            else:
+                body = str(error)
+
+        body_lower = body.lower() if body else ""
+
+        status_code = None
+        if hasattr(error, "status_code"):
+            status_code = error.status_code
+        elif hasattr(error, "response") and hasattr(error.response, "status_code"):
+            status_code = error.response.status_code
+
+        if status_code != 429 and "429" not in body_lower:
+            return None
+
+        quota_keywords = [
+            "limit", "balance", "subscription", "exceeded",
+            "usage", "insufficient", "cap", "exhausted",
+        ]
+        per_request_keywords = ["per minute", "per_minute", "per second", "per_second"]
+
+        if any(kw in body_lower for kw in per_request_keywords):
+            return {"retry_after": None, "reason": "rate_limit_exceeded"}
+
+        if any(kw in body_lower for kw in quota_keywords):
+            return {"retry_after": None, "reason": "subscription_quota_exhausted"}
+
+        return {"retry_after": None, "reason": "quota_exhausted"}
+
+    # Quota groups for tracking weekly input tokens.
+    # All real models share the weekly_tokens pool (subscription-level quota).
+    # get_model_quota_group() override below returns "weekly_tokens" for all models.
     model_quota_groups = {
         "weekly_tokens": ["_weekly_tokens"],
     }
@@ -1148,18 +1203,33 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
                             weekly_token_remaining = weekly_token_data.get("remaining", 0)
                             weekly_token_reset_ts = weekly_token_data.get("reset_at", 0)
                             weekly_token_used = weekly_token_limit - weekly_token_remaining if weekly_token_limit > 0 else 0
+
+                            effectively_exhausted = (
+                                weekly_token_limit > 0
+                                and weekly_token_remaining <= NANOGPT_EXHAUSTION_TOKEN_THRESHOLD
+                                and weekly_token_reset_ts > 0
+                            )
+
                             await usage_manager.update_quota_baseline(
                                 api_key,
                                 "nanogpt/_weekly_tokens",
                                 quota_max_requests=weekly_token_limit,
                                 quota_reset_ts=weekly_token_reset_ts if weekly_token_reset_ts > 0 else None,
                                 quota_used=weekly_token_used,
+                                apply_exhaustion=effectively_exhausted,
                             )
 
-                            lib_logger.debug(
-                                f"Updated NanoGPT quota baseline: "
-                                f"weekly_tokens={weekly_token_remaining}/{weekly_token_limit}"
-                            )
+                            if effectively_exhausted:
+                                lib_logger.info(
+                                    f"NanoGPT weekly token quota effectively exhausted: "
+                                    f"{weekly_token_remaining}/{weekly_token_limit} remaining "
+                                    f"(threshold={NANOGPT_EXHAUSTION_TOKEN_THRESHOLD})"
+                                )
+                            else:
+                                lib_logger.debug(
+                                    f"Updated NanoGPT quota baseline: "
+                                    f"weekly_tokens={weekly_token_remaining}/{weekly_token_limit}"
+                                )
 
                 except Exception as e:
                     lib_logger.warning(

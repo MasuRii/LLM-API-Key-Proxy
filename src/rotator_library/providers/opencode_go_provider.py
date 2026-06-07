@@ -58,12 +58,70 @@ class OpencodeProvider(OpencodeQuotaTracker, ProviderInterface):
         "client",
     }
 
-    # Define the quota groups using the window names as model keys
+    @staticmethod
+    def parse_quota_error(
+        error: Exception, error_body: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Parse OpenCode-specific quota errors.
+
+        OpenCode returns:
+        - "Monthly usage limit reached. Resets in 3 days." → quota exhaustion
+        - "5-hour usage limit reached" / "Weekly usage limit reached" → shorter-term quota
+        """
+        import re
+
+        body = error_body
+        if not body:
+            if hasattr(error, "response") and hasattr(error.response, "text"):
+                body = error.response.text
+            elif hasattr(error, "body"):
+                body = str(error.body) if not isinstance(error.body, str) else error.body
+            else:
+                body = str(error)
+
+        body_lower = body.lower() if body else ""
+
+        if "usage limit" not in body_lower and "limit reached" not in body_lower:
+            return None
+
+        retry_after = None
+        days_match = re.search(r"resets? in\s*(\d+)\s*days?", body_lower)
+        if days_match:
+            retry_after = int(days_match.group(1)) * 86400
+
+        if "monthly" in body_lower:
+            return {"retry_after": retry_after, "reason": "monthly_quota_exhausted"}
+        if "weekly" in body_lower:
+            return {"retry_after": retry_after, "reason": "weekly_quota_exhausted"}
+        if "5-hour" in body_lower or "5 hour" in body_lower or "rolling" in body_lower:
+            return {"retry_after": retry_after, "reason": "rolling_quota_exhausted"}
+
+        return {"retry_after": retry_after, "reason": "quota_exhausted"}
+
+    # Quota groups: display-only time windows + a hidden global group for blocking.
+    # The tiered windows (5hr < weekly < monthly) are for dashboard visibility.
+    # "opencode_go-global" is the key CooldownChecker uses during credential selection.
     model_quota_groups = {
         "5hr": ["5hr"],
         "weekly": ["weekly"],
         "monthly": ["monthly"],
+        "opencode_go-global": [],
     }
+
+    hidden_quota_groups = frozenset({"opencode_go-global"})
+
+    # Tier hierarchy: higher-tier exhaustion implies all lower tiers are blocked.
+    # monthly > weekly > 5hr.  When monthly is exhausted the credential cannot be used
+    # even if 5hr/weekly windows show remaining capacity (that capacity is unreachable).
+    QUOTA_TIER_HIERARCHY = ["5hr", "weekly", "monthly"]
+
+    def get_model_quota_group(self, model: str) -> Optional[str]:
+        """All real models share the opencode_go-global quota pool."""
+        clean = model.split("/")[-1] if "/" in model else model
+        if clean in ("5hr", "weekly", "monthly"):
+            return clean
+        return "opencode_go-global"
 
     def __init__(self):
         super().__init__()
@@ -484,27 +542,59 @@ class OpencodeProvider(OpencodeQuotaTracker, ProviderInterface):
                     "weeklyUsage": "weekly",
                     "monthlyUsage": "monthly"
                 }
+
+                # Collect per-window data for hierarchical exhaustion
+                window_data = {}
                 for raw_key, model_key in windows_map.items():
                     win_data = usage_raw.get(raw_key, {})
                     if isinstance(win_data, dict):
                         usage_percent = win_data.get("usagePercent", 0)
                         reset_in = win_data.get("resetInSec")
                         reset_ts = now + (reset_in if reset_in is not None else 0)
-                        
-                        # Round to 2 decimal places to avoid floating point noise
-                        # Use 0.0001 as minimum to force TUI visibility (shows reset time)
-                        val_to_store = round(float(usage_percent), 2)
-                        if val_to_store <= 0:
-                            val_to_store = 0.0001
-                        
-                        await usage_manager.update_quota_baseline(
-                            ident,
-                            model_key,
-                            quota_max_requests=100,
-                            quota_used=val_to_store,
-                            quota_reset_ts=reset_ts,
-                            force=force
-                        )
+                        window_data[model_key] = {
+                            "usage_percent": usage_percent,
+                            "reset_ts": reset_ts,
+                        }
+
+                # Store each display window baseline
+                for model_key, wd in window_data.items():
+                    val_to_store = round(float(wd["usage_percent"]), 2)
+                    if val_to_store <= 0:
+                        val_to_store = 0.0001
+
+                    await usage_manager.update_quota_baseline(
+                        ident,
+                        model_key,
+                        quota_max_requests=100,
+                        quota_used=val_to_store,
+                        quota_reset_ts=wd["reset_ts"],
+                        force=force,
+                        apply_exhaustion=False,
+                    )
+
+                # Hierarchical exhaustion: monthly > weekly > 5hr.
+                # The highest-tier exhausted window determines if the credential
+                # is blocked, using its reset_ts as the cooldown duration.
+                global_exhausted = False
+                global_reset_ts = None
+                for tier_key in reversed(self.QUOTA_TIER_HIERARCHY):
+                    wd = window_data.get(tier_key)
+                    if wd and wd["usage_percent"] >= 100.0 and wd["reset_ts"] > now:
+                        global_exhausted = True
+                        global_reset_ts = wd["reset_ts"]
+                        break
+
+                await usage_manager.update_quota_baseline(
+                    ident,
+                    "opencode_go-global",
+                    quota_max_requests=100,
+                    quota_used=100 if global_exhausted else 0,
+                    quota_reset_ts=global_reset_ts,
+                    quota_group="opencode_go-global",
+                    force=force,
+                    apply_exhaustion=global_exhausted,
+                )
+
                 stored_count += 1
         return stored_count
 
