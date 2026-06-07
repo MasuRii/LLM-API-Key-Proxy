@@ -63,6 +63,12 @@ def _parse_duration_string(duration_str: str) -> Optional[int]:
         # Round up to at least 1 second to avoid immediate retry floods
         return max(1, int(seconds)) if seconds > 0 else 0
 
+    # Parse days component
+    day_match = re.match(r"(\d+)d", remaining)
+    if day_match:
+        total_seconds += int(day_match.group(1)) * 86400
+        remaining = remaining[day_match.end() :]
+
     # Parse hours component
     hour_match = re.match(r"(\d+)h", remaining)
     if hour_match:
@@ -106,16 +112,19 @@ def extract_retry_after_from_body(error_body: Optional[str]) -> Optional[int]:
 
     # Pattern to match various "reset after" formats - capture the full duration string
     patterns = [
-        r"quota will reset after\s*([\dhmso.]+)",  # Matches compound: 156h14m36s or 120s
-        r"reset after\s*([\dhmso.]+)",
-        r"retry after\s*([\dhmso.]+)",
-        r"try again in\s*(\d+)\s*seconds?",
+        (r"quota will reset after\s*([\ddhmso.]+)", False),
+        (r"reset after\s*([\ddhmso.]+)", False),
+        (r"retry after\s*([\ddhmso.]+)", False),
+        (r"try again in\s*(\d+)\s*seconds?", False),
+        (r"resets? in\s*(\d+)\s*days?", True),
     ]
 
-    for pattern in patterns:
+    for pattern, is_days in patterns:
         match = re.search(pattern, error_body, re.IGNORECASE)
         if match:
             duration_str = match.group(1)
+            if is_days:
+                duration_str = duration_str + "d"
             result = _parse_duration_string(duration_str)
             if result is not None:
                 return result
@@ -797,16 +806,21 @@ def get_retry_after(error: Exception) -> Optional[int]:
         r"wait for\s*(\d+)\s*seconds?",
         r'"retrydelay":\s*"([\d.]+)s?"',  # retryDelay in JSON (lowercased)
         r"x-ratelimit-reset:?\s*(\d+)",
+        # "Resets in N days" patterns (e.g., OpenCode "Resets in 3 days")
+        r"resets? in\s*(\d+)\s*days?",
         # Compound duration patterns.
-        r"quota will reset after\s*([\dhms.]+)",  # e.g., "156h14m36s" or "120s"
-        r"reset after\s*([\dhms.]+)",
-        r'"quotaresetdelay":\s*"([\dhms.]+)"',  # quotaResetDelay in JSON (lowercased)
+        r"quota will reset after\s*([\ddhms.]+)",  # e.g., "3d", "156h14m36s" or "120s"
+        r"reset after\s*([\ddhms.]+)",
+        r'"quotaresetdelay":\s*"([\ddhms.]+)"',  # quotaResetDelay in JSON (lowercased)
     ]
 
     for pattern in patterns:
         match = re.search(pattern, error_str_lower)
         if match:
             duration_str = match.group(1)
+            # Normalize "resets in N days" → "Nd" for _parse_duration_string
+            if "days" in pattern:
+                duration_str = duration_str + "d"
             # Try parsing as compound duration first
             result = _parse_duration_string(duration_str)
             if result is not None:
@@ -991,7 +1005,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
         if status_code == 429:
             retry_after = get_retry_after(e)
             # Check if this is a quota error vs rate limit
-            if "quota" in error_body or "resource_exhausted" in error_body or "usage_limit" in error_body:
+            if "quota" in error_body or "resource_exhausted" in error_body or "usage_limit" in error_body or "usage limit" in error_body or "limit reached" in error_body:
                 # Extract quota details from the original (non-lowercased) response
                 quota_value, quota_id = None, None
                 try:
@@ -1133,7 +1147,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
         retry_after = get_retry_after(e)
         # Check if this is a quota error vs rate limit
         error_msg = str(e).lower()
-        if "quota" in error_msg or "resource_exhausted" in error_msg:
+        if "quota" in error_msg or "resource_exhausted" in error_msg or "usage_limit" in error_msg or "usage limit" in error_msg or "limit reached" in error_msg:
             # Try to extract quota details from exception body
             quota_value, quota_id = None, None
             try:
