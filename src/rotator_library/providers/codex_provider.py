@@ -137,6 +137,14 @@ _FALLBACK_REASONING_EFFORTS: Dict[str, set] = {
     "gpt-5.2": {"low", "medium", "high", "xhigh"},
     "codex-auto-review": {"low", "medium", "high", "xhigh"},
 }
+_FALLBACK_CONTEXT_LIMITS: Dict[str, int] = {
+    "gpt-5.5": 272000,
+    "gpt-5.4": 1000000,
+    "gpt-5.4-mini": 272000,
+    "gpt-5.3-codex": 272000,
+    "gpt-5.2": 272000,
+    "codex-auto-review": 1000000,
+}
 
 # Module-level cache for dynamic model data
 _models_cache: Optional[Dict[str, Any]] = None
@@ -147,8 +155,9 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
     """
     Fetch models.json from the Codex GitHub repo.
 
-    Returns a dict with 'base_models' (list of slugs) and
+    Returns a dict with 'base_models' (list of slugs),
     'reasoning_efforts' (dict of slug -> set of effort levels),
+    and 'context_limits' (dict of slug -> effective context window),
     or None on failure.
     """
     import urllib.request
@@ -168,6 +177,7 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
 
         base_models = []
         reasoning_efforts = {}
+        context_limits: Dict[str, int] = {}
 
         for m in models_list:
             slug = m.get("slug", "")
@@ -191,6 +201,16 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
                 if efforts:
                     reasoning_efforts[slug] = efforts
 
+            # The upstream models.json provides two fields: "context_window"
+            # (current active limit) and "max_context_window" (maximum the model
+            # can handle). The proxy doesn't have a two-tier concept, so we
+            # always prefer max_context_window when available.
+            max_ctx = m.get("max_context_window")
+            ctx = m.get("context_window")
+            effective = max_ctx or ctx
+            if effective:
+                context_limits[slug] = effective
+
         lib_logger.info(
             f"[Codex] Fetched {len(base_models)} models from GitHub: "
             f"{', '.join(base_models)}"
@@ -198,6 +218,7 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
         return {
             "base_models": base_models,
             "reasoning_efforts": reasoning_efforts,
+            "context_limits": context_limits,
         }
 
     except Exception as e:
@@ -222,9 +243,10 @@ def _get_model_data() -> Dict[str, Any]:
     if fetched is not None:
         _models_cache = fetched
         _models_cache_time = now
-        global _FALLBACK_BASE_MODELS, _FALLBACK_REASONING_EFFORTS
+        global _FALLBACK_BASE_MODELS, _FALLBACK_REASONING_EFFORTS, _FALLBACK_CONTEXT_LIMITS
         _FALLBACK_BASE_MODELS = list(fetched["base_models"])
         _FALLBACK_REASONING_EFFORTS = dict(fetched["reasoning_efforts"])
+        _FALLBACK_CONTEXT_LIMITS = dict(fetched.get("context_limits", {}))
         lib_logger.info(
             f"[Codex] Updated fallback model list from GitHub: "
             f"{', '.join(_FALLBACK_BASE_MODELS)}"
@@ -241,6 +263,7 @@ def _get_model_data() -> Dict[str, Any]:
     fallback = {
         "base_models": list(_FALLBACK_BASE_MODELS),
         "reasoning_efforts": dict(_FALLBACK_REASONING_EFFORTS),
+        "context_limits": dict(_FALLBACK_CONTEXT_LIMITS),
     }
     _models_cache = fallback
     _models_cache_time = now
@@ -266,6 +289,16 @@ def _build_available_models() -> list:
 def get_available_models() -> list:
     """Public accessor for the current available models list (base models only)."""
     return _build_available_models()
+
+
+def get_model_context_limits() -> Dict[str, int]:
+    """
+    Return authoritative context window limits from upstream models.json.
+
+    Prefers max_context_window over context_window since the proxy
+    does not have a two-tier concept. Returns dict of slug -> effective_window.
+    """
+    return _get_model_data().get("context_limits", {})
 
 
 # For backward compatibility / class-level references that need a static list at import time,

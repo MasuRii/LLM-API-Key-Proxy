@@ -1047,6 +1047,11 @@ async def chat_completions(
                     request, request_data, response_generator, raw_logger
                 ),
                 media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
             )
         else:
             response = await client.acompletion(request=request, **request_data)
@@ -1423,6 +1428,27 @@ async def list_models(
             # Return enriched model data
             enriched_data = model_info_service.enrich_model_list(model_ids)
 
+            # Apply authoritative context limits from Codex upstream
+            # models.json — overrides fuzzy-matched catalog data that
+            # may report incorrect context windows.
+            # Prefers max_context_window over context_window since the
+            # proxy does not have a two-tier concept.
+            try:
+                from rotator_library.providers.codex_provider import get_model_context_limits
+                codex_ctx = get_model_context_limits()
+                if codex_ctx:
+                    for entry in enriched_data:
+                        eid = entry.get("id", "")
+                        if eid.startswith("codex/"):
+                            slug = eid[len("codex/"):]
+                            ctx_win = codex_ctx.get(slug)
+                            if ctx_win:
+                                entry["context_window"] = ctx_win
+                                entry["context_length"] = ctx_win
+                                entry["max_input_tokens"] = ctx_win
+            except ImportError:
+                pass
+
             # For "latest" virtual models, inherit metadata from the
             # model they currently resolve to (pricing, context window, etc.)
             if latest_models:
@@ -1482,7 +1508,18 @@ async def get_model(
         if model_info_service.is_ready:
             info = model_info_service.get_model_info(model_id)
             if info:
-                return info.to_dict()
+                result = info.to_dict()
+                if model_id.startswith("codex/"):
+                    try:
+                        from rotator_library.providers.codex_provider import get_model_context_limits
+                        ctx_win = get_model_context_limits().get(model_id[len("codex/"):])
+                        if ctx_win:
+                            result["context_window"] = ctx_win
+                            result["context_length"] = ctx_win
+                            result["max_input_tokens"] = ctx_win
+                    except ImportError:
+                        pass
+                return result
 
     # Return basic info if service not ready or model not found
     return {
