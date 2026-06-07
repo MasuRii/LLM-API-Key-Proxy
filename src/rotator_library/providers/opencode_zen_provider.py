@@ -15,32 +15,32 @@ if not lib_logger.handlers:
     lib_logger.addHandler(logging.NullHandler())
 
 
-class ZenmuxProvider(ProviderInterface):
+class OpencodeZenProvider(ProviderInterface):
     """
-    Provider for ZenMux via OpenCode Zen gateway - OpenAI-compatible API.
+    Provider for OpenCode Zen gateway - OpenAI-compatible API.
 
-    Accesses free tier models through OpenCode's Zen gateway which proxies
-    to ZenMux. Uses a public API key for free models.
+    Accesses free tier models through OpenCode's Zen gateway.
+    Uses a public API key for free models.
 
     Free models have the "-free" suffix in their model IDs.
 
     Environment Variables:
-        ZENMUX_API_BASE - The API base URL (default: https://opencode.ai/zen/v1)
+        OPENCODE_ZEN_API_BASE - The API base URL (default: https://opencode.ai/zen/v1)
 
     Custom Headers Required:
         HTTP-Referer: https://opencode.ai/
         X-Title: opencode
     """
 
-    provider_env_name = "zenmux"
-    skip_cost_calculation: bool = True  # ZenMux free models have no cost tracking
+    provider_env_name = "opencode_zen"
+    skip_cost_calculation: bool = True
 
     def __init__(self):
         super().__init__()
-        self.api_base = os.getenv("ZENMUX_API_BASE", "https://opencode.ai/zen/v1")
+        self.api_base = os.getenv("OPENCODE_ZEN_API_BASE", "https://opencode.ai/zen/v1")
 
     def _get_headers(self) -> Dict[str, str]:
-        """Return the custom headers required by ZenMux."""
+        """Return the custom headers required by OpenCode Zen."""
         return {
             "HTTP-Referer": "https://opencode.ai/",
             "X-Title": "opencode",
@@ -48,7 +48,7 @@ class ZenmuxProvider(ProviderInterface):
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
-        Fetch available models from ZenMux.
+        Fetch available models from OpenCode Zen.
 
         The models endpoint is public and doesn't require authentication.
         """
@@ -66,12 +66,12 @@ class ZenmuxProvider(ProviderInterface):
             for model in data.get("data", []):
                 model_id = model.get("id")
                 if model_id:
-                    models.append(f"zenmux/{model_id}")
+                    models.append(f"opencode_zen/{model_id}")
 
-            lib_logger.info(f"Discovered {len(models)} models from ZenMux")
+            lib_logger.info(f"Discovered {len(models)} models from OpenCode Zen")
 
         except Exception as e:
-            lib_logger.warning(f"Failed to fetch models from ZenMux: {e}")
+            lib_logger.warning(f"Failed to fetch models from OpenCode Zen: {e}")
 
         return models
 
@@ -80,6 +80,36 @@ class ZenmuxProvider(ProviderInterface):
         Returns True because we need to handle API calls with custom headers.
         """
         return True
+
+    @staticmethod
+    def _strip_unsupported_content(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Strip non-text content parts from messages.
+
+        ZenMux free-tier models (DeepSeek, etc.) don't support multimodal
+        inputs. If content is a list, keep only text parts; if only non-text
+        parts remain, flatten to an empty string to avoid sending an empty array.
+        """
+        new_messages = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            text_parts.append(part)
+                    elif isinstance(part, str):
+                        text_parts.append({"type": "text", "text": part})
+                if not text_parts:
+                    new_messages.append({**msg, "content": ""})
+                elif len(text_parts) == 1:
+                    new_messages.append({**msg, "content": text_parts[0].get("text", "")})
+                else:
+                    new_messages.append({**msg, "content": text_parts})
+            else:
+                new_messages.append(msg)
+        return new_messages
 
     async def acompletion(
         self,
@@ -96,11 +126,16 @@ class ZenmuxProvider(ProviderInterface):
         kwargs.pop("credential_identifier", None)
         kwargs.pop("transaction_context", None)
 
+        # Strip unsupported multimodal content (image_url etc.)
+        messages = kwargs.get("messages")
+        if messages:
+            kwargs["messages"] = self._strip_unsupported_content(messages)
+
         # Transform model name for LiteLLM's OpenAI provider
-        # "zenmux/gpt-4-free" -> "openai/gpt-4-free"
+        # "opencode_zen/deepseek-v4-flash-free" -> "openai/deepseek-v4-flash-free"
         model = kwargs.get("model", "")
-        if model.startswith("zenmux/"):
-            kwargs["model"] = "openai/" + model[len("zenmux/") :]
+        if "/" in model:
+            kwargs["model"] = "openai/" + model.split("/", 1)[1]
 
         # Add custom headers to the kwargs (without mutating caller's dict)
         extra_headers = self._get_headers()
@@ -141,8 +176,8 @@ class ZenmuxProvider(ProviderInterface):
 
         # Transform model name for LiteLLM's OpenAI provider
         model = kwargs.get("model", "")
-        if model.startswith("zenmux/"):
-            kwargs["model"] = "openai/" + model[len("zenmux/") :]
+        if "/" in model:
+            kwargs["model"] = "openai/" + model.split("/", 1)[1]
 
         # Add custom headers (without mutating caller's dict)
         extra_headers = self._get_headers()
@@ -161,19 +196,13 @@ class ZenmuxProvider(ProviderInterface):
     def convert_safety_settings(
         self, settings: Dict[str, str]
     ) -> Optional[List[Dict[str, Any]]]:
-        """
-        ZenMux doesn't have specific safety settings to convert.
-        """
+        """OpenCode Zen doesn't have specific safety settings to convert."""
         return None
 
     def get_credential_tier_name(self, credential: str) -> Optional[str]:
-        """
-        ZenMux free models are all free tier.
-        """
+        """All OpenCode Zen models are free tier."""
         return "free-tier"
 
     def get_model_tier_requirement(self, model: str) -> Optional[int]:
-        """
-        All ZenMux models available through this provider are free tier.
-        """
+        """All models available through this provider are free tier."""
         return None

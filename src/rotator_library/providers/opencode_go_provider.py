@@ -218,6 +218,9 @@ class OpencodeProvider(OpencodeQuotaTracker, ProviderInterface):
             "opencode_go/kimi-k2.6",
         ]
 
+    # Models that only accept plain string content (no multipart arrays)
+    TEXT_ONLY_MODELS = frozenset({"kimi", "moonshot", "glm"})
+
     def _is_deepseek_v4(self, model: str) -> bool:
         """Check if model is a DeepSeek V4 variant."""
         return "deepseek-v4" in model.lower()
@@ -225,6 +228,36 @@ class OpencodeProvider(OpencodeQuotaTracker, ProviderInterface):
     def _is_moonshot(self, model: str) -> bool:
         """Check if model is a Moonshot (Kimi) variant."""
         return "kimi" in model.lower() or "moonshot" in model.lower()
+
+    def _requires_string_content(self, model: str) -> bool:
+        """Check if model requires plain string content (no multipart arrays)."""
+        model_lower = model.lower()
+        return any(k in model_lower for k in self.TEXT_ONLY_MODELS)
+
+    @staticmethod
+    def _flatten_content_to_string(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Flatten multipart content arrays to plain strings.
+
+        Providers like Kimi/GLM reject the OpenAI multipart format
+        [{"type": "text", "text": "..."}] and only accept string content.
+        Image parts are discarded since these models don't support vision.
+        """
+        new_messages = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                    elif isinstance(part, str):
+                        text_parts.append(part)
+                new_messages.append({**msg, "content": "\n".join(text_parts) if text_parts else ""})
+            else:
+                new_messages.append(msg)
+        return new_messages
 
     def _fix_moonshot_json_schema(self, schema: Any) -> Any:
         """
@@ -407,6 +440,12 @@ class OpencodeProvider(OpencodeQuotaTracker, ProviderInterface):
         kwargs.pop("transaction_context", None)
         model = kwargs.get("model", "")
         model_bare = model.split("/")[-1] if "/" in model else model
+
+        # Flatten multipart content for models that only accept strings
+        if self._requires_string_content(model):
+            messages = kwargs.get("messages")
+            if messages:
+                kwargs["messages"] = self._flatten_content_to_string(messages)
 
         # Apply model-specific fixes
         self._ensure_deepseek_v4_tool_choice(kwargs, model)
