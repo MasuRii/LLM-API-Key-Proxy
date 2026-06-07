@@ -728,6 +728,9 @@ class RequestExecutor:
                         cred, model, state, quota_group, availability, usage_manager
                     )
 
+                    if context.transaction_logger:
+                        context.transaction_logger.credential_masked = mask_credential(cred)
+
                     try:
                         # Prepare request kwargs
                         kwargs = await self._prepare_request_kwargs(
@@ -999,6 +1002,9 @@ class RequestExecutor:
                         self._log_acquired_credential(
                             cred, model, state, quota_group, availability, usage_manager
                         )
+
+                        if context.transaction_logger:
+                            context.transaction_logger.credential_masked = mask_credential(cred)
 
                         try:
                             # Prepare request kwargs

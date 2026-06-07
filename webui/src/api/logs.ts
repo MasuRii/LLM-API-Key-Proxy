@@ -15,6 +15,7 @@ export interface TransactionSummary {
   prompt_preview: string
   log_level: string
   format: "oai" | "ant"
+  credential_masked?: string | null
 }
 
 export interface TransactionDetail {

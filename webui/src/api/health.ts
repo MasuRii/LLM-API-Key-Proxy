@@ -43,7 +43,7 @@ export interface ErrorRecord {
   error_type: string
   status_code: number | null
   error_message: string
-  credential_masked?: string
+  credential?: string
   attempt?: number
 }
 

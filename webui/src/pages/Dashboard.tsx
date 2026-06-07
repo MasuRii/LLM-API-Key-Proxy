@@ -216,6 +216,9 @@ export function Dashboard() {
                         <div className="flex items-center gap-2">
                           <span className="font-medium">{err.provider}</span>
                           <Badge variant="outline" className="text-[10px]">{err.error_type}</Badge>
+                          {err.credential && (
+                            <Badge variant="secondary" className="text-[10px] font-mono">{err.credential}</Badge>
+                          )}
                           <span className="text-xs text-muted-foreground ml-auto shrink-0">
                             <Clock className="h-3 w-3 inline mr-0.5" />
                             {timeAgo(err.timestamp)}
@@ -235,6 +238,9 @@ export function Dashboard() {
                         <div className="flex items-center gap-2">
                           <span className="font-medium">{f.provider || f.model?.split("/")[0] || "unknown"}</span>
                           <Badge variant="outline" className="text-[10px]">{f.error_type}</Badge>
+                          {f.api_key_ending && (
+                            <Badge variant="secondary" className="text-[10px] font-mono">...{f.api_key_ending}</Badge>
+                          )}
                           <span className="text-xs text-muted-foreground ml-auto shrink-0">
                             <Clock className="h-3 w-3 inline mr-0.5" />
                             {timeAgo(f.timestamp)}

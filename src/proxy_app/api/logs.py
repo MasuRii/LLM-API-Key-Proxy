@@ -257,6 +257,7 @@ async def list_transactions(
                 "prompt_preview": preview,
                 "log_level": log_level,
                 "format": parsed["api_format"],
+                "credential_masked": meta.get("credential_masked"),
             })
 
         matched += 1
@@ -382,13 +383,19 @@ async def list_failures(
 
     raw_lines = _tail_lines(failures_path)
     entries = []
+    provider_counts: dict[str, int] = {}
+    error_type_counts: dict[str, int] = {}
     for line in raw_lines:
         try:
             data = json.loads(line)
+            model = data.get("model", "N/A")
+            provider = model.split("/")[0] if "/" in model else "unknown"
+            error_type = data.get("error_type", "Unknown")
             entries.append({
                 "timestamp": data.get("timestamp", ""),
-                "model": data.get("model", "N/A"),
-                "error_type": data.get("error_type", "Unknown"),
+                "model": model,
+                "provider": provider,
+                "error_type": error_type,
                 "error_message": data.get("error_message", ""),
                 "raw_response": data.get("raw_response", ""),
                 "request_headers": data.get("request_headers"),
@@ -399,6 +406,8 @@ async def list_failures(
                 "api_key_ending": data.get("api_key_ending", ""),
                 "attempt_number": data.get("attempt_number", 1),
             })
+            provider_counts[provider] = provider_counts.get(provider, 0) + 1
+            error_type_counts[error_type] = error_type_counts.get(error_type, 0) + 1
         except json.JSONDecodeError:
             continue
 
@@ -412,4 +421,12 @@ async def list_failures(
         "total": total,
         "page": page,
         "page_size": page_size,
+        "providers": [
+            {"name": name, "count": count}
+            for name, count in sorted(provider_counts.items(), key=lambda x: -x[1])
+        ],
+        "error_types": [
+            {"type": et, "count": count}
+            for et, count in sorted(error_type_counts.items(), key=lambda x: -x[1])
+        ],
     }

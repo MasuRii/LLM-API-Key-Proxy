@@ -231,6 +231,9 @@ function TransactionBrowser() {
                 <div className="flex items-center gap-2 min-w-0">
                   <StatusBadge status={tx.status} />
                   <span className="font-medium text-sm shrink-0">{tx.provider}</span>
+                  {tx.credential_masked && (
+                    <Badge variant="secondary" className="text-[10px] font-mono shrink-0">{tx.credential_masked}</Badge>
+                  )}
                   {shortPrompt && (
                     <span className="text-xs text-muted-foreground truncate hidden sm:inline">&mdash; {tx.prompt_preview}</span>
                   )}
@@ -258,6 +261,10 @@ function TransactionBrowser() {
                     <div>
                       <span className="text-muted-foreground">Request ID</span>
                       <p className="font-mono">{tx.request_id}</p>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Credential</span>
+                      <p className="font-mono">{tx.credential_masked || "—"}</p>
                     </div>
                     <div>
                       <span className="text-muted-foreground">Timestamp</span>
@@ -450,6 +457,9 @@ function FailureBrowser() {
                   {f.provider && <span className="font-medium text-sm">{f.provider}</span>}
                   <span className="font-medium text-sm">{f.error_type}</span>
                   <Badge variant="outline" className="text-[10px]">{f.model}</Badge>
+                  {f.api_key_ending && (
+                    <Badge variant="secondary" className="text-[10px] font-mono">...{f.api_key_ending}</Badge>
+                  )}
                 </div>
                 <span className="text-xs text-muted-foreground">{timeAgo(f.timestamp)}</span>
               </div>
