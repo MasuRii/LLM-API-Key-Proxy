@@ -954,13 +954,17 @@ class UsageManager:
             }
         )
 
-        # Compute hidden groups once for the entire response
+        # Compute hidden groups and defined groups once for the entire response
         hidden_groups: frozenset = frozenset()
+        defined_groups: frozenset = frozenset()
         plugin_class = self._provider_plugins.get(self.provider)
         if plugin_class:
             plugin_instance = self._get_provider_plugin_instance()
-            if plugin_instance and hasattr(plugin_instance, "hidden_quota_groups"):
-                hidden_groups = plugin_instance.hidden_quota_groups
+            if plugin_instance:
+                if hasattr(plugin_instance, "hidden_quota_groups"):
+                    hidden_groups = plugin_instance.hidden_quota_groups
+                if hasattr(plugin_instance, "model_quota_groups"):
+                    defined_groups = frozenset(plugin_instance.model_quota_groups.keys())
 
         for stable_id, state in self._states.items():
             # Skip credentials not currently active in the proxy
@@ -987,12 +991,34 @@ class UsageManager:
             # Determine final status based on real cooldowns only.
             # Fair cycle exhaustion is an internal rotation concern and
             # does not mean the credential's quota is actually exhausted.
-            known_groups = set(state.group_usage.keys()) if state.group_usage else set()
+            all_group_keys = set(state.group_usage.keys()) if state.group_usage else set()
+
+            # Scope known_groups to provider-defined groups if available.
+            # Stale group_usage entries (e.g., from older versions) should not
+            # prevent "exhausted" status when all current groups are on cooldown.
+            if defined_groups:
+                known_groups = all_group_keys & defined_groups
+            else:
+                known_groups = all_group_keys
+
+            # Hidden groups (e.g., "opencode_go-global", "codex-global") are
+            # provider-wide routing keys that all real models resolve to.
+            # A cooldown on a hidden group means ALL models are blocked.
+            has_hidden_group_cooldown = bool(
+                hidden_groups and any(g in hidden_groups for g in cooldown_groups)
+            )
+
+            # For the "all groups exhausted?" check, exclude hidden routing
+            # keys — they're internal and shouldn't prevent "exhausted" status
+            # when all visible windows are on cooldown.
+            visible_known_groups = known_groups - hidden_groups if hidden_groups else known_groups
 
             if has_global_cooldown:
                 status = "cooldown"
+            elif has_hidden_group_cooldown:
+                status = "exhausted"
             elif has_group_cooldown:
-                if known_groups and set(cooldown_groups) >= known_groups:
+                if visible_known_groups and set(cooldown_groups) >= visible_known_groups:
                     status = "exhausted"
                 else:
                     status = "mixed"
@@ -1302,7 +1328,13 @@ class UsageManager:
                 )
                 tier_stats["total"] += 1
 
-                # Aggregate per-window stats
+                # Aggregate per-window stats.
+                # Exhausted credentials should not contribute remaining
+                # capacity to global totals — their quota windows may show
+                # headroom (e.g. 5hr/weekly) that is unreachable because a
+                # higher-tier window (e.g. monthly) is fully consumed.
+                cred_is_blocked = status in ("exhausted", "cooldown")
+
                 for window_name, window in group_windows.items():
                     window_agg = group_agg[
                         "windows"
@@ -1324,21 +1356,24 @@ class UsageManager:
                     )
                     tier_avail["total"] += 1
 
-                    # Check if this credential has quota remaining in this window
                     limit = window.get("limit")
                     if limit is not None:
                         used = window["request_count"]
                         remaining = max(0, limit - used)
-                        window_agg["total_used"] += used
-                        window_agg["total_remaining"] += remaining
+
+                        if cred_is_blocked:
+                            window_agg["total_used"] += limit
+                            window_agg["total_remaining"] += 0
+                        else:
+                            window_agg["total_used"] += used
+                            window_agg["total_remaining"] += remaining
                         window_agg["total_max"] += limit
 
-                        # Credential has availability if remaining > 0
-                        if remaining > 0:
+                        if remaining > 0 and not cred_is_blocked:
                             tier_avail["available"] += 1
                     else:
-                        # No limit = unlimited = always available
-                        tier_avail["available"] += 1
+                        if not cred_is_blocked:
+                            tier_avail["available"] += 1
 
             # Add active cooldowns (filter hidden groups)
             for key, cooldown in state.cooldowns.items():
