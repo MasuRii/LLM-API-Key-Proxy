@@ -19,6 +19,9 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +339,229 @@ def integration_test_fallback_to_models_api_key():
 
 
 # ---------------------------------------------------------------------------
-# 7.  Test self-referential base URL skip
+# 7.  RED tests for platform-agnostic Pi metadata discovery
+# ---------------------------------------------------------------------------
+
+ACTIVE_PROVIDER_ID = "active-fixture"
+ACTIVE_PREFIX = "ACTIVE_FIXTURE"
+ACTIVE_BASE_URL = "https://active-fixture.invalid/v1"
+ACTIVE_MODEL_ID = "active-fixture/model-alpha"
+ACTIVE_CREDENTIAL_VALUE = "fixture-value-active"
+
+STALE_PROVIDER_ID = "stale-fixture"
+STALE_PREFIX = "STALE_FIXTURE"
+STALE_BASE_URL = "https://stale-fixture.invalid/v1"
+STALE_MODEL_ID = "stale-fixture/model-old"
+STALE_CREDENTIAL_VALUE = "fixture-value-stale"
+
+HOME_PROVIDER_ID = "home-fixture"
+HOME_PREFIX = "HOME_FIXTURE"
+HOME_BASE_URL = "https://home-fixture.invalid/v1"
+HOME_MODEL_ID = "home-fixture/model-home"
+HOME_CREDENTIAL_VALUE = "fixture-value-home"
+
+_PROVIDER_PREFIXES = (ACTIVE_PREFIX, STALE_PREFIX, HOME_PREFIX)
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _write_pi_agent_files(
+    home_dir: Path,
+    *,
+    auth_data: dict[str, Any],
+    models_data: dict[str, Any] | None = None,
+) -> Path:
+    agent_dir = home_dir / ".pi" / "agent"
+    _write_json(agent_dir / "auth.json", auth_data)
+    _write_json(agent_dir / "models.json", models_data or {"providers": {}})
+    return agent_dir
+
+
+def _write_provider_extension(
+    extensions_dir: Path,
+    *,
+    provider_id: str,
+    base_url: str,
+    model_ids: list[str],
+) -> Path:
+    extension_dir = extensions_dir / f"pi-{provider_id}-provider"
+    _write_json(
+        extension_dir / "package.json",
+        {
+            "name": f"pi-{provider_id}-provider",
+            "version": "0.0.0-test",
+            "pi": {"extensions": [{"kind": "provider", "config": "config.json"}]},
+        },
+    )
+    _write_json(
+        extension_dir / "config.json",
+        {
+            "providerId": provider_id,
+            "displayName": provider_id.replace("-", " ").title(),
+            "api": "openai-completions",
+            "baseUrl": base_url,
+            "upstreamUrl": base_url,
+            "models": [{"id": model_id} for model_id in model_ids],
+        },
+    )
+    return extension_dir
+
+
+def _read_cache(summary_cache_path: str | None) -> dict[str, Any]:
+    assert summary_cache_path, "expected importer to write a cache file"
+    return json.loads(Path(summary_cache_path).read_text(encoding="utf-8"))
+
+
+def _is_managed_provider_env(name: str) -> bool:
+    return any(name == prefix or name.startswith(f"{prefix}_") for prefix in _PROVIDER_PREFIXES)
+
+
+@pytest.fixture(autouse=True)
+def isolated_pi_metadata_discovery_env(monkeypatch: pytest.MonkeyPatch):
+    """Keep metadata-discovery tests isolated from local Pi state and secrets."""
+    for name in [
+        "PI_AGENT_IMPORT_ENABLED",
+        "PI_AGENT_CACHE_PATH",
+        "PI_AGENT_CREDENTIAL_OVERRIDES_DIR",
+        "PI_AGENT_AUTH_ALIASES",
+        "PI_AGENT_SKIP_PROVIDERS",
+    ]:
+        monkeypatch.delenv(name, raising=False)
+
+    for name in list(os.environ):
+        if _is_managed_provider_env(name):
+            monkeypatch.delenv(name, raising=False)
+
+    yield
+
+    for name in list(os.environ):
+        if _is_managed_provider_env(name):
+            os.environ.pop(name, None)
+
+
+def test_active_extension_metadata_imports_auth_only_provider_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Active extension metadata should make an auth-only provider importable."""
+    home_dir = tmp_path / "home"
+    root_dir = tmp_path / "proxy-root"
+    agent_dir = _write_pi_agent_files(
+        home_dir,
+        auth_data={ACTIVE_PROVIDER_ID: {"type": "api_key", "key": ACTIVE_CREDENTIAL_VALUE}},
+    )
+    _write_provider_extension(
+        agent_dir / "extensions",
+        provider_id=ACTIVE_PROVIDER_ID,
+        base_url=ACTIVE_BASE_URL,
+        model_ids=[ACTIVE_MODEL_ID],
+    )
+    monkeypatch.setenv("PI_AGENT_AUTH_PATH", str(agent_dir / "auth.json"))
+    monkeypatch.setenv("PI_AGENT_MODELS_PATH", str(agent_dir / "models.json"))
+
+    summary = pai.import_pi_agent_config(root_dir=root_dir)
+
+    assert summary.enabled is True
+    assert summary.providers_loaded == 1, (
+        "expected active extension metadata to supplement empty models.json; "
+        f"got: {summary.compact_message()}"
+    )
+    assert summary.api_keys_loaded == 1
+    assert summary.models_loaded == 1
+    assert os.environ.get(f"{ACTIVE_PREFIX}_API_BASE") == ACTIVE_BASE_URL
+    assert os.environ.get(f"{ACTIVE_PREFIX}_API_KEY_1") == ACTIVE_CREDENTIAL_VALUE
+
+    models = json.loads(os.environ[f"{ACTIVE_PREFIX}_MODELS"])
+    assert models == {"model-alpha": {"id": ACTIVE_MODEL_ID}}
+
+
+def test_deprecated_extension_metadata_is_ignored_even_when_auth_entry_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deprecated extensions must not be used as provider metadata sources."""
+    home_dir = tmp_path / "home"
+    root_dir = tmp_path / "proxy-root"
+    agent_dir = _write_pi_agent_files(
+        home_dir,
+        auth_data={
+            ACTIVE_PROVIDER_ID: {"type": "api_key", "key": ACTIVE_CREDENTIAL_VALUE},
+            STALE_PROVIDER_ID: {"type": "api_key", "key": STALE_CREDENTIAL_VALUE},
+        },
+    )
+    _write_provider_extension(
+        agent_dir / "extensions",
+        provider_id=ACTIVE_PROVIDER_ID,
+        base_url=ACTIVE_BASE_URL,
+        model_ids=[ACTIVE_MODEL_ID],
+    )
+    _write_provider_extension(
+        home_dir / ".pi" / "deprecate" / "extensions",
+        provider_id=STALE_PROVIDER_ID,
+        base_url=STALE_BASE_URL,
+        model_ids=[STALE_MODEL_ID],
+    )
+    monkeypatch.setenv("PI_AGENT_AUTH_PATH", str(agent_dir / "auth.json"))
+    monkeypatch.setenv("PI_AGENT_MODELS_PATH", str(agent_dir / "models.json"))
+
+    summary = pai.import_pi_agent_config(root_dir=root_dir)
+
+    assert summary.providers_loaded == 1, (
+        "expected only the active extension provider to load; "
+        f"got: {summary.compact_message()}"
+    )
+    assert os.environ.get(f"{ACTIVE_PREFIX}_API_BASE") == ACTIVE_BASE_URL
+    assert f"{STALE_PREFIX}_API_BASE" not in os.environ
+    assert f"{STALE_PREFIX}_API_KEY_1" not in os.environ
+
+    cache_payload = _read_cache(summary.cache_path)
+    assert "active_fixture" in cache_payload["providers"]
+    assert "stale_fixture" not in cache_payload["providers"]
+
+
+def test_pi_metadata_discovery_uses_home_relative_paths_when_env_paths_are_unset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Importer discovery should use the caller's home directory on every platform."""
+    home_dir = tmp_path / "portable-home"
+    root_dir = tmp_path / "proxy-root"
+    agent_dir = _write_pi_agent_files(
+        home_dir,
+        auth_data={HOME_PROVIDER_ID: {"type": "api_key", "key": HOME_CREDENTIAL_VALUE}},
+    )
+    _write_provider_extension(
+        agent_dir / "extensions",
+        provider_id=HOME_PROVIDER_ID,
+        base_url=HOME_BASE_URL,
+        model_ids=[HOME_MODEL_ID],
+    )
+    monkeypatch.delenv("PI_AGENT_AUTH_PATH", raising=False)
+    monkeypatch.delenv("PI_AGENT_MODELS_PATH", raising=False)
+    monkeypatch.setenv("HOME", str(home_dir))
+    monkeypatch.setenv("USERPROFILE", str(home_dir))
+
+    summary = pai.import_pi_agent_config(root_dir=root_dir)
+
+    assert summary.enabled is True, (
+        "expected importer to discover ~/.pi/agent/auth.json and models.json from "
+        "the test home directory without PI_AGENT_* path overrides"
+    )
+    assert summary.providers_loaded == 1
+    assert summary.api_keys_loaded == 1
+    assert os.environ.get(f"{HOME_PREFIX}_API_BASE") == HOME_BASE_URL
+    assert os.environ.get(f"{HOME_PREFIX}_API_KEY_1") == HOME_CREDENTIAL_VALUE
+
+    cache_payload = _read_cache(summary.cache_path)
+    assert Path(cache_payload["source"]["auth_path"]) == agent_dir / "auth.json"
+    assert Path(cache_payload["source"]["models_path"]) == agent_dir / "models.json"
+
+
+# ---------------------------------------------------------------------------
+# 8.  Test self-referential base URL skip
 # ---------------------------------------------------------------------------
 
 def test_self_referential_base_url():

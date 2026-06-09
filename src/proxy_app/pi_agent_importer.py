@@ -88,7 +88,7 @@ class PiAgentImportSummary:
     def compact_message(self) -> str:
         """Return a concise human-readable startup message."""
         if not self.enabled:
-            return "Pi agent import disabled (PI_AGENT_AUTH_PATH/PI_AGENT_MODELS_PATH not set)."
+            return "Pi agent import disabled (no Pi auth/models metadata found)."
 
         message = (
             "Pi agent import loaded "
@@ -116,12 +116,10 @@ def import_pi_agent_config(
 ) -> PiAgentImportSummary:
     """Load Pi auth/models JSON files and expose them as proxy env vars.
 
-    Required env vars:
-        PI_AGENT_AUTH_PATH: path to Pi auth.json
-        PI_AGENT_MODELS_PATH: path to Pi models.json
-
     Optional env vars:
         PI_AGENT_IMPORT_ENABLED=false: disable importer
+        PI_AGENT_AUTH_PATH: override path to Pi auth.json
+        PI_AGENT_MODELS_PATH: override path to Pi models.json
         PI_AGENT_CACHE_PATH: override cache output path
         PI_AGENT_CREDENTIAL_OVERRIDES_DIR: override directory for large request overrides
         PI_AGENT_AUTH_ALIASES: comma list like "aistudio:google,foo:bar|baz"
@@ -132,27 +130,39 @@ def import_pi_agent_config(
     if os.getenv("PI_AGENT_IMPORT_ENABLED", "true").lower() in {"0", "false", "no"}:
         return summary
 
-    auth_path_raw = os.getenv("PI_AGENT_AUTH_PATH")
-    models_path_raw = os.getenv("PI_AGENT_MODELS_PATH")
-    if not auth_path_raw and not models_path_raw:
+    auth_path, models_path = _resolve_pi_metadata_paths(
+        os.getenv("PI_AGENT_AUTH_PATH"),
+        os.getenv("PI_AGENT_MODELS_PATH"),
+    )
+    if auth_path is None and models_path is None:
         return summary
 
     summary.enabled = True
-    if not auth_path_raw or not models_path_raw:
+    if auth_path is None or models_path is None:
         summary.warnings.append(
-            "Both PI_AGENT_AUTH_PATH and PI_AGENT_MODELS_PATH are required."
+            "Both PI_AGENT_AUTH_PATH and PI_AGENT_MODELS_PATH are required, "
+            "or ~/.pi/agent/auth.json and models.json must both exist."
         )
         return summary
 
-    auth_path = _resolve_path(auth_path_raw)
-    models_path = _resolve_path(models_path_raw)
     auth_data = _load_json_object(auth_path, "PI_AGENT_AUTH_PATH", summary)
     models_data = _load_json_object(models_path, "PI_AGENT_MODELS_PATH", summary)
     if auth_data is None or models_data is None:
         return summary
 
-    providers = models_data.get("providers")
-    if not isinstance(providers, dict):
+    providers_raw = models_data.get("providers")
+    providers = dict(providers_raw) if isinstance(providers_raw, dict) else {}
+    providers.update(
+        {
+            provider_id: provider_config
+            for provider_id, provider_config in _discover_active_extension_providers(
+                auth_path,
+                models_path,
+            ).items()
+            if provider_id not in providers
+        }
+    )
+    if not isinstance(providers_raw, dict) and not providers:
         summary.warnings.append("PI_AGENT_MODELS_PATH does not contain a providers object.")
         return summary
 
@@ -293,6 +303,242 @@ def _load_json_object(
         summary.warnings.append(f"{label} must contain a JSON object.")
         return None
     return data
+
+
+def _resolve_pi_metadata_paths(
+    auth_path_raw: str | None,
+    models_path_raw: str | None,
+) -> tuple[Path | None, Path | None]:
+    if auth_path_raw or models_path_raw:
+        auth_path = _resolve_path(auth_path_raw) if auth_path_raw else None
+        models_path = _resolve_path(models_path_raw) if models_path_raw else None
+        return auth_path, models_path
+
+    for agent_dir in _candidate_pi_agent_dirs():
+        candidate_auth_path = agent_dir / "auth.json"
+        candidate_models_path = agent_dir / "models.json"
+        if candidate_auth_path.is_file() and candidate_models_path.is_file():
+            return candidate_auth_path, candidate_models_path
+
+    return None, None
+
+
+def _candidate_pi_agent_dirs() -> list[Path]:
+    return [home_dir / ".pi" / "agent" for home_dir in _candidate_home_dirs()]
+
+
+def _candidate_home_dirs() -> list[Path]:
+    candidates: list[Path] = []
+    for env_name in ("HOME", "USERPROFILE"):
+        env_value = os.getenv(env_name)
+        if env_value:
+            candidates.append(_resolve_path(env_value))
+
+    home_drive = os.getenv("HOMEDRIVE")
+    home_path = os.getenv("HOMEPATH")
+    if home_drive and home_path:
+        candidates.append(_resolve_path(f"{home_drive}{home_path}"))
+
+    try:
+        candidates.append(Path.home())
+    except RuntimeError:
+        pass
+
+    return _dedupe_paths(candidates)
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        try:
+            key = os.path.normcase(str(path.resolve(strict=False)))
+        except OSError:
+            key = os.path.normcase(str(path.absolute()))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _discover_active_extension_providers(
+    auth_path: Path,
+    models_path: Path,
+) -> dict[str, dict[str, Any]]:
+    providers: dict[str, dict[str, Any]] = {}
+    for extensions_root in _active_extension_roots(auth_path, models_path):
+        for extension_dir in _iter_extension_package_dirs(extensions_root):
+            package_data = _load_json_file_object(extension_dir / "package.json")
+            if package_data is None:
+                continue
+            for provider_config in _load_extension_provider_configs(extension_dir, package_data):
+                normalized_provider = _normalize_extension_provider_config(provider_config)
+                if normalized_provider is None:
+                    continue
+                provider_id = str(normalized_provider.pop("providerId"))
+                providers.setdefault(provider_id, normalized_provider)
+    return providers
+
+
+def _active_extension_roots(auth_path: Path, models_path: Path) -> list[Path]:
+    candidates = [auth_path.parent / "extensions", models_path.parent / "extensions"]
+    return [path for path in _dedupe_paths(candidates) if path.is_dir()]
+
+
+def _iter_extension_package_dirs(extensions_root: Path):
+    if (extensions_root / "package.json").is_file():
+        yield extensions_root
+
+    try:
+        children = sorted(extensions_root.iterdir(), key=lambda path: path.name.lower())
+    except OSError:
+        return
+
+    for child in children:
+        if child.is_dir() and (child / "package.json").is_file():
+            yield child
+
+
+def _load_json_file_object(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _load_extension_provider_configs(
+    extension_dir: Path,
+    package_data: dict[str, Any],
+) -> list[dict[str, Any]]:
+    configs: list[dict[str, Any]] = []
+    config_paths: list[Path] = []
+
+    pi_metadata = package_data.get("pi")
+    if isinstance(pi_metadata, dict):
+        extension_entries = pi_metadata.get("extensions")
+        if isinstance(extension_entries, list):
+            for entry in extension_entries:
+                if not isinstance(entry, dict):
+                    continue
+                kind = str(entry.get("kind") or entry.get("type") or "").strip().lower()
+                if kind and kind != "provider":
+                    continue
+                config_value = entry.get("config") or entry.get("configPath") or entry.get("path")
+                if isinstance(config_value, dict):
+                    configs.append(config_value)
+                elif isinstance(config_value, str):
+                    config_path = _safe_extension_config_path(extension_dir, config_value)
+                    if config_path is not None:
+                        config_paths.append(config_path)
+
+        provider_metadata = pi_metadata.get("provider")
+        if isinstance(provider_metadata, dict):
+            configs.append(provider_metadata)
+
+    if not config_paths:
+        fallback_path = extension_dir / "config.json"
+        if fallback_path.is_file():
+            config_paths.append(fallback_path)
+
+    for config_path in _dedupe_paths(config_paths):
+        config_data = _load_json_file_object(config_path)
+        if config_data is not None:
+            configs.append(config_data)
+
+    return configs
+
+
+def _safe_extension_config_path(extension_dir: Path, config_value: str) -> Path | None:
+    config_name = config_value.strip()
+    if not config_name:
+        return None
+
+    try:
+        extension_root = extension_dir.resolve(strict=False)
+        config_path = (extension_dir / config_name).resolve(strict=False)
+    except OSError:
+        return None
+
+    if not config_path.is_relative_to(extension_root):
+        return None
+    return config_path
+
+
+def _normalize_extension_provider_config(
+    config_data: dict[str, Any],
+) -> dict[str, Any] | None:
+    provider_id = _first_string(config_data, "providerId", "provider_id", "id")
+    if not provider_id:
+        return None
+
+    models = _normalize_extension_models(config_data.get("models"))
+    if not models:
+        return None
+
+    api_type = _first_string(config_data, "api", "apiType", "api_type") or ""
+    base_url = _first_string(
+        config_data,
+        "baseUrl",
+        "base_url",
+        "upstreamUrl",
+        "upstream_url",
+    )
+
+    provider_config: dict[str, Any] = {
+        "providerId": provider_id,
+        "api": api_type,
+        "baseUrl": base_url or "",
+        "models": models,
+    }
+    api_key = _first_string(config_data, "apiKey", "api_key")
+    if api_key:
+        provider_config["apiKey"] = api_key
+    return provider_config
+
+
+def _normalize_extension_models(models: Any) -> list[dict[str, Any]]:
+    if isinstance(models, list):
+        return [model for item in models if (model := _normalize_extension_model(item))]
+
+    if isinstance(models, dict):
+        normalized_models: list[dict[str, Any]] = []
+        for model_id, model_config in models.items():
+            model = _normalize_extension_model(model_config)
+            if model is None and isinstance(model_id, str):
+                model = {"id": model_id}
+            elif model is not None and not model.get("id") and isinstance(model_id, str):
+                model["id"] = model_id
+            if model is not None:
+                normalized_models.append(model)
+        return normalized_models
+
+    return []
+
+
+def _normalize_extension_model(model: Any) -> dict[str, Any] | None:
+    if isinstance(model, str) and model.strip():
+        return {"id": model.strip()}
+
+    if not isinstance(model, dict):
+        return None
+
+    normalized_model = dict(model)
+    model_id = _first_string(normalized_model, "id", "modelId", "model_id", "name")
+    if not model_id:
+        return None
+    normalized_model["id"] = model_id
+    return normalized_model
+
+
+def _first_string(data: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _load_csv_env(name: str) -> set[str]:
