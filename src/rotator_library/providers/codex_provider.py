@@ -111,6 +111,10 @@ CODEX_WS_ENDPOINT = _derive_ws_endpoint()
 # Reasoning effort levels (superset of all known levels)
 REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
 
+# Service tier values accepted by the Codex Responses API.
+SERVICE_TIER_VALUES = {"auto", "default", "flex", "scale", "priority"}
+SERVICE_TIER_ALIASES = {"fast": "priority"}
+
 # =============================================================================
 # DYNAMIC MODEL DISCOVERY
 # =============================================================================
@@ -465,6 +469,30 @@ def _build_reasoning_param(
         reasoning["summary"] = summary
 
     return reasoning
+
+
+def _normalize_service_tier(value: Any) -> Optional[str]:
+    """Normalize optional Codex service_tier for upstream Responses API."""
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        raise ValueError("Codex service_tier must be a string when provided")
+
+    service_tier = value.strip()
+    if not service_tier:
+        return None
+
+    if service_tier in SERVICE_TIER_ALIASES:
+        return SERVICE_TIER_ALIASES[service_tier]
+
+    if service_tier in SERVICE_TIER_VALUES:
+        return service_tier
+
+    supported_values = ", ".join(sorted((*SERVICE_TIER_VALUES, *SERVICE_TIER_ALIASES)))
+    raise ValueError(
+        f"Unsupported Codex service_tier {value!r}. Supported values: {supported_values}"
+    )
 
 
 def _normalize_model_name(name: str) -> str:
@@ -1165,6 +1193,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         parallel_tool_calls = kwargs.get("parallel_tool_calls", False)
         credential_path = kwargs.pop("credential_identifier", kwargs.get("credential_path", ""))
         reasoning_effort = kwargs.get("reasoning_effort", DEFAULT_REASONING_EFFORT)
+        service_tier = _normalize_service_tier(kwargs.get("service_tier"))
         extra_headers = kwargs.get("extra_headers", {})
         session_id = kwargs.get("session_id") or kwargs.get("sessionId") or ""
 
@@ -1270,6 +1299,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             "store": False,
             "text": {"verbosity": "medium"},  # Match pi's default; controls output structure
         }
+
+        if service_tier:
+            payload["service_tier"] = service_tier
 
         # The Codex Responses API requires the 'instructions' field — it's non-optional.
         # Always include it; fall back to the Codex system instruction if nothing else.
