@@ -16,9 +16,7 @@ import logging
 import litellm
 from typing import Dict, Any, Set, Optional
 
-from .litellm_providers import (
-    SCRAPED_PROVIDERS,
-)
+from .litellm_providers import SCRAPED_PROVIDERS
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -760,9 +758,11 @@ class ProviderConfig:
 
         # Extract provider from model string (e.g., "openai/gpt-4" → "openai")
         provider = model.split("/")[0].lower()
+        explicit_api_base = kwargs.get("api_base")
         provider_override = provider_override or {}
         api_base = (
-            provider_override.get("base_url")
+            explicit_api_base
+            or provider_override.get("base_url")
             or provider_override.get("api_base")
             or self._api_bases.get(provider)
         )

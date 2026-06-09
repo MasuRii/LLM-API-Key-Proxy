@@ -149,6 +149,12 @@ class ProviderTransforms:
                 for key, value in model_options.items():
                     if key == "reasoning_effort":
                         kwargs["reasoning_effort"] = value
+                    elif key == "extra_headers" and isinstance(value, dict):
+                        existing = kwargs.get("extra_headers")
+                        merged = dict(value)
+                        if isinstance(existing, dict):
+                            merged.update(existing)
+                        kwargs["extra_headers"] = merged
                     elif key not in kwargs:
                         kwargs[key] = value
                 modifications.append(f"applied model options for {model}")

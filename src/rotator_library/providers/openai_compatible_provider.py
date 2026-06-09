@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
+import hashlib
+import json
 import os
+from pathlib import Path
+import uuid
 import httpx
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from .provider_interface import ProviderInterface
 from ..model_definitions import ModelDefinitions
 
@@ -46,6 +50,7 @@ class OpenAICompatibleProvider(ProviderInterface):
 
         # Initialize model definitions loader
         self.model_definitions = ModelDefinitions()
+        self._credential_overrides = self._load_credential_overrides()
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
@@ -108,6 +113,127 @@ class OpenAICompatibleProvider(ProviderInterface):
             model_name = model_name.split("/")[-1]
 
         return self.model_definitions.get_model_options(self.provider_name, model_name)
+
+    def _load_credential_overrides(self) -> Dict[str, Dict[str, Any]]:
+        """Load credential-scoped request overrides from environment JSON or file."""
+        env_prefix = self.provider_name.upper()
+        overrides: Dict[str, Dict[str, Any]] = {}
+
+        env_name = f"{env_prefix}_CREDENTIAL_OVERRIDES"
+        raw = os.getenv(env_name)
+        if raw:
+            parsed = self._load_credential_override_json(raw, env_name)
+            if parsed:
+                overrides.update(parsed)
+
+        path_env_name = f"{env_prefix}_CREDENTIAL_OVERRIDES_PATH"
+        path_raw = os.getenv(path_env_name)
+        if path_raw:
+            try:
+                raw = Path(path_raw).expanduser().read_text(encoding="utf-8")
+            except OSError as exc:
+                lib_logger.warning(
+                    f"Could not read credential overrides from {path_env_name}: {exc}"
+                )
+            else:
+                parsed = self._load_credential_override_json(raw, path_env_name)
+                if parsed:
+                    overrides.update(parsed)
+
+        return overrides
+
+    @staticmethod
+    def _load_credential_override_json(
+        raw: str,
+        source: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            lib_logger.warning(f"Invalid JSON in {source}; ignoring credential overrides")
+            return {}
+        if not isinstance(parsed, dict):
+            lib_logger.warning(f"{source} must be a JSON object; ignoring")
+            return {}
+
+        overrides: Dict[str, Dict[str, Any]] = {}
+        for credential_hash, value in parsed.items():
+            if isinstance(credential_hash, str) and isinstance(value, dict):
+                overrides[credential_hash] = value
+        return overrides
+
+    @staticmethod
+    def _credential_hash(credential: str) -> str:
+        return hashlib.sha256(credential.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _merge_headers(
+        existing_headers: Any,
+        new_headers: Dict[str, str],
+    ) -> Dict[str, str]:
+        merged = dict(existing_headers) if isinstance(existing_headers, dict) else {}
+        merged.update(new_headers)
+        return merged
+
+    def _default_request_headers(self) -> Dict[str, str]:
+        """Provider-specific headers needed by some Pi OpenAI-compatible providers."""
+        provider = self.provider_name.lower()
+        if provider == "kilo":
+            return {"X-KILOCODE-EDITORNAME": "Pi"}
+        if provider == "cline":
+            return {
+                "Accept": "application/json",
+                "User-Agent": "Cline/3.80.0",
+                "X-PLATFORM": "Visual Studio Code",
+                "X-PLATFORM-VERSION": "1.109.3",
+                "X-CLIENT-TYPE": "VSCode Extension",
+                "X-CLIENT-VERSION": "3.80.0",
+                "X-CORE-VERSION": "3.80.0",
+                "HTTP-Referer": "https://cline.bot",
+                "X-Title": "Cline",
+                "X-TASK-ID": uuid.uuid4().hex,
+                "X-IS-MULTIROOT": "false",
+            }
+        return {}
+
+    async def transform_request(
+        self,
+        kwargs: Dict[str, Any],
+        model_name: str,
+        credential: str,
+    ) -> List[str]:
+        """Apply Pi-imported credential base URL/header overrides."""
+        modifications: List[str] = []
+
+        default_headers = self._default_request_headers()
+        if default_headers:
+            kwargs["extra_headers"] = self._merge_headers(
+                kwargs.get("extra_headers"),
+                default_headers,
+            )
+            modifications.append("applied provider request headers")
+
+        override = self._credential_overrides.get(self._credential_hash(credential), {})
+        base_url = override.get("base_url")
+        if isinstance(base_url, str) and base_url.strip():
+            kwargs["api_base"] = base_url.rstrip("/")
+            modifications.append("applied credential api_base override")
+
+        headers = override.get("headers")
+        if isinstance(headers, dict):
+            normalized_headers = {
+                str(key): value
+                for key, value in headers.items()
+                if isinstance(value, str)
+            }
+            if normalized_headers:
+                kwargs["extra_headers"] = self._merge_headers(
+                    kwargs.get("extra_headers"),
+                    normalized_headers,
+                )
+                modifications.append("applied credential header overrides")
+
+        return modifications
 
     def has_custom_logic(self) -> bool:
         """

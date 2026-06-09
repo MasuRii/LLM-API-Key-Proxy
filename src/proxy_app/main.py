@@ -150,6 +150,20 @@ with _console.status("[dim]Loading LiteLLM library...", spinner="dots"):
 
         CustomStreamWrapper.raise_on_model_repetition = _patched_raise_on_model_repetition
 
+print("  → Importing Pi agent config...")
+with _console.status("[dim]Importing Pi agent config...", spinner="dots"):
+    from proxy_app.pi_agent_importer import import_pi_agent_config
+
+    _pi_agent_import_summary = import_pi_agent_config(
+        root_dir=_root_dir,
+        current_port=args.port,
+    )
+
+if _pi_agent_import_summary.enabled:
+    print(f"  → {_pi_agent_import_summary.compact_message()}")
+    for _pi_warning in _pi_agent_import_summary.warnings:
+        print(f"  ⚠ Pi agent import: {_pi_warning}")
+
 # Phase 4: Application imports with granular loading messages
 print("  → Initializing proxy core...")
 with _console.status("[dim]Initializing proxy core...", spinner="dots"):
