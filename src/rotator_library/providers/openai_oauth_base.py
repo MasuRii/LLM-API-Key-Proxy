@@ -37,7 +37,10 @@ from rich.text import Text
 from rich.markup import escape as rich_escape
 
 from ..utils.headless_detection import is_headless_environment
-from ..utils.reauth_coordinator import get_reauth_coordinator
+from ..utils.reauth_coordinator import (
+    get_reauth_coordinator,
+    is_auto_oauth_reauth_enabled,
+)
 from ..utils.resilient_io import safe_write_json
 from ..error_handler import CredentialNeedsReauthError
 from ..proxy_config import ProxyConfig
@@ -442,10 +445,19 @@ class OpenAIOAuthBase:
                             lib_logger.info(
                                 f"Credential '{Path(path).name}' needs re-auth (HTTP 400: invalid_grant)."
                             )
-                            asyncio.create_task(
-                                self._queue_refresh(path, force=True, needs_reauth=True)
-                            )
-                            msg = f"Refresh token invalid for '{Path(path).name}'. Re-auth queued."
+                            if is_auto_oauth_reauth_enabled():
+                                asyncio.create_task(
+                                    self._queue_refresh(path, force=True, needs_reauth=True)
+                                )
+                                msg = f"Refresh token invalid for '{Path(path).name}'. Re-auth queued."
+                            else:
+                                self._unavailable_credentials[path] = time.time()
+                                msg = (
+                                    f"Refresh token invalid for '{Path(path).name}'. "
+                                    "Automatic OAuth re-auth is disabled. Run the credential tool "
+                                    "to re-authenticate manually, or set OAUTH_AUTO_REAUTH_ENABLED=true "
+                                    "to allow automatic OAuth prompts."
+                                )
                             self._record_refresh_error(path, "CredentialNeedsReauth", msg, 400)
                             raise CredentialNeedsReauthError(
                                 credential_path=path,
@@ -456,10 +468,19 @@ class OpenAIOAuthBase:
                             lib_logger.info(
                                 f"Credential '{Path(path).name}' needs re-auth (HTTP {status_code})."
                             )
-                            asyncio.create_task(
-                                self._queue_refresh(path, force=True, needs_reauth=True)
-                            )
-                            msg = f"Token invalid for '{Path(path).name}' (HTTP {status_code}). Re-auth queued."
+                            if is_auto_oauth_reauth_enabled():
+                                asyncio.create_task(
+                                    self._queue_refresh(path, force=True, needs_reauth=True)
+                                )
+                                msg = f"Token invalid for '{Path(path).name}' (HTTP {status_code}). Re-auth queued."
+                            else:
+                                self._unavailable_credentials[path] = time.time()
+                                msg = (
+                                    f"Token invalid for '{Path(path).name}' (HTTP {status_code}). "
+                                    "Automatic OAuth re-auth is disabled. Run the credential tool "
+                                    "to re-authenticate manually, or set OAUTH_AUTO_REAUTH_ENABLED=true "
+                                    "to allow automatic OAuth prompts."
+                                )
                             self._record_refresh_error(path, "CredentialNeedsReauth", msg, status_code)
                             raise CredentialNeedsReauthError(
                                 credential_path=path,
@@ -554,6 +575,14 @@ class OpenAIOAuthBase:
             if path in self._next_refresh_after:
                 if now < self._next_refresh_after[path]:
                     return
+        elif not is_auto_oauth_reauth_enabled():
+            self._unavailable_credentials[path] = time.time()
+            lib_logger.warning(
+                "Automatic OAuth re-auth for '%s' skipped because "
+                "OAUTH_AUTO_REAUTH_ENABLED is not true.",
+                Path(path).name,
+            )
+            return
 
         async with self._queue_tracking_lock:
             if path not in self._queued_credentials:
@@ -1022,13 +1051,28 @@ class OpenAIOAuthBase:
                     try:
                         return await self._refresh_token(path, creds)
                     except Exception as e:
-                        lib_logger.warning(
-                            f"Automatic token refresh for '{display_name}' failed: {e}. Proceeding to interactive login."
-                        )
+                        if path and not is_auto_oauth_reauth_enabled():
+                            lib_logger.warning(
+                                f"Automatic token refresh for '{display_name}' failed: {e}. "
+                                "Automatic interactive OAuth is disabled."
+                            )
+                        else:
+                            lib_logger.warning(
+                                f"Automatic token refresh for '{display_name}' failed: {e}. "
+                                "Proceeding to interactive login."
+                            )
 
                 lib_logger.warning(
                     f"{self.ENV_PREFIX} OAuth token for '{display_name}' needs setup: {reason}."
                 )
+
+                if path and not is_auto_oauth_reauth_enabled():
+                    self._unavailable_credentials[path] = time.time()
+                    raise ValueError(
+                        f"Automatic interactive OAuth is disabled for '{display_name}'. "
+                        "Run the credential tool to re-authenticate manually, or set "
+                        "OAUTH_AUTO_REAUTH_ENABLED=true to allow automatic OAuth prompts."
+                    )
 
                 coordinator = get_reauth_coordinator()
 

@@ -17,6 +17,7 @@ regardless of which provider the credential belongs to.
 
 import asyncio
 import logging
+import os
 import time
 from typing import Callable, Optional, Dict, Any, Awaitable
 from pathlib import Path
@@ -34,6 +35,37 @@ DEFAULT_REAUTH_TIMEOUT: float = 300.0  # 5 minutes
 # Threshold for logging queue wait time (in seconds)
 # Waits longer than this will be logged
 REAUTH_QUEUE_LOG_THRESHOLD: float = 1.0
+
+TRUE_ENV_VALUES = {"1", "true", "yes", "on", "enabled"}
+FALSE_ENV_VALUES = {"0", "false", "no", "off", "disabled"}
+
+
+def read_bool_env(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable using common true/false values."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in TRUE_ENV_VALUES:
+        return True
+    if normalized in FALSE_ENV_VALUES:
+        return False
+
+    lib_logger.warning(
+        "Invalid %s value %r. Expected one of: %s/%s. Falling back to %s.",
+        name,
+        value,
+        ", ".join(sorted(TRUE_ENV_VALUES)),
+        ", ".join(sorted(FALSE_ENV_VALUES)),
+        default,
+    )
+    return default
+
+
+def is_auto_oauth_reauth_enabled() -> bool:
+    """Return whether server-initiated interactive OAuth prompts are allowed."""
+    return read_bool_env("OAUTH_AUTO_REAUTH_ENABLED", default=False)
 
 
 class ReauthCoordinator:

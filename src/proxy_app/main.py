@@ -171,6 +171,10 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library.credential_manager import CredentialManager
     from rotator_library.model_info_service import init_model_info_service
     from rotator_library.core.errors import ProxyExhaustionError
+    from rotator_library.utils.reauth_coordinator import (
+        is_auto_oauth_reauth_enabled,
+        read_bool_env,
+    )
     from proxy_app.request_logger import log_request_to_console
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import RawIOLogger
@@ -480,19 +484,30 @@ def apply_model_alias(model_name: str) -> str:
         return rewritten
     return model_name
 
+
+def oauth_startup_init_enabled() -> bool:
+    """Return whether OAuth credentials should be validated during server startup."""
+    if os.getenv("OAUTH_STARTUP_INIT_ENABLED") is not None:
+        return read_bool_env("OAUTH_STARTUP_INIT_ENABLED", default=False)
+
+    if os.getenv("SKIP_OAUTH_INIT_CHECK") is not None:
+        return not read_bool_env("SKIP_OAUTH_INIT_CHECK", default=True)
+
+    return is_auto_oauth_reauth_enabled()
+
+
 # --- Lifespan Management ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the RotatingClient's lifecycle with the app's lifespan."""
-    # [MODIFIED] Perform skippable OAuth initialization at startup
-    skip_oauth_init = os.getenv("SKIP_OAUTH_INIT_CHECK", "false").lower() == "true"
+    run_oauth_init = oauth_startup_init_enabled()
 
     # The CredentialManager now handles all discovery, including .env overrides.
     # We pass all environment variables to it for this purpose.
     cred_manager = CredentialManager(os.environ)
     oauth_credentials = cred_manager.discover_and_prepare()
 
-    if not skip_oauth_init and oauth_credentials:
+    if run_oauth_init and oauth_credentials:
         logging.info("Starting OAuth credential validation and deduplication...")
         processed_emails = {}  # email -> {provider: path}
         credentials_to_initialize = {}  # provider -> [paths]
@@ -644,6 +659,12 @@ async def lifespan(app: FastAPI):
 
         logging.info("OAuth credential processing complete.")
         oauth_credentials = final_oauth_credentials
+    elif oauth_credentials:
+        logging.info(
+            "OAuth startup validation skipped. Set OAUTH_AUTO_REAUTH_ENABLED=true "
+            "to allow automatic OAuth prompts, or OAUTH_STARTUP_INIT_ENABLED=true "
+            "to validate and deduplicate without enabling prompts."
+        )
 
     # [NEW] Load provider-specific params
     litellm_provider_params = {
