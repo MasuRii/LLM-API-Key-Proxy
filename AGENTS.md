@@ -8,7 +8,8 @@ alwaysApply: true
 ## ⚠️ MANDATORY: Read Before Any Code Change
 
 This repository is a **fork** maintained as a linear commit stack on top of `upstream/dev`.
-**You MUST follow the workflow below for every change you make, no exceptions.**
+
+Agents MUST NOT create commits, run autosquash/rebase, or push changes unless the user explicitly requests that git operation. The workflow below documents the repository's preferred git history when git operations are requested.
 
 ---
 
@@ -39,7 +40,7 @@ topic prefix is treated as a stable feature identifier.
 
 ---
 
-## Making a Change
+## Making a Change Without Automatic Git Operations
 
 ### Step 1: Identify which commit owns the files you're changing
 
@@ -65,9 +66,9 @@ Match files to commits:
 | `credential_manager.py`, `credential_tool.py` | `feat(core):` |
 | `tests/*` | `feat: add local test suite` |
 
-### Step 2: Lint all changed Python files before staging
+### Step 2: Lint all changed Python files before completion
 
-**MANDATORY — do not skip this step.** Run the following on every `.py` file you touched:
+**MANDATORY — do not skip this step for Python edits.** Run the following on every `.py` file you touched before reporting completion, and before staging if a commit was explicitly requested:
 
 ```bash
 # Syntax check (stdlib — zero deps)
@@ -81,14 +82,16 @@ uv run ruff check src/path/to/file.py --select F401,F811,F821,E9
 > `ruff` commands with `uv run` rather than relying on system-level installations.
 
 The pre-commit hook (`.git/hooks/pre-commit`) also runs these automatically when
-you `git commit`, but running them manually first gives faster feedback.
+a commit is explicitly requested, but running them manually first gives faster feedback.
 
 Common things to verify after a change:
 - Every name used in the file is either defined locally or imported.
 - No import statements were accidentally deleted while editing.
 - `py_compile` exits 0.
 
-### Step 3: Commit with the `fixup!` prefix
+### Step 3: Stop unless git operations were explicitly requested
+
+Do not stage, commit, rebase, or push by default. If the user explicitly asks for a commit, use the repository's linear-stack convention:
 
 ```bash
 # Edit files...
@@ -99,40 +102,26 @@ git commit -m "fixup! feat(codex): Responses API rewrite, dynamic model discover
 > **CRITICAL:** The text after `fixup!` must **exactly match** the first line of the
 > target commit. Copy it from `git log --oneline`.
 
-### Step 4: Fold it into the correct commit
-
-```bash
-GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash upstream/dev
-```
-
-This automatically moves your fixup commit next to its target and squashes them.
-
-### Step 5: Push
-
-```bash
-git push origin dev --force-with-lease
-```
+Only run autosquash/rebase or push when the user explicitly requests that operation.
 
 ---
 
 ## Adding an Entirely New Feature
 
+When the user explicitly requests a commit for an entirely new feature, commit at the tip with a new prefix:
+
 ```bash
-# Just commit at the tip with a new prefix:
 git add -A
 git commit -m "feat(newprovider): add SomeProvider with quota tracking"
-
-# Push
-git push origin dev --force-with-lease
 ```
 
-No fixup needed — new features go at the end of the stack naturally.
+No fixup needed — new features go at the end of the stack naturally. Do not push unless the user explicitly requests a push.
 
 ---
 
 ## Upstream Sync
 
-When the upstream repository updates:
+Do not sync upstream automatically. When the user explicitly requests an upstream sync:
 
 ```bash
 git fetch upstream
@@ -142,37 +131,39 @@ git push origin dev --force-with-lease
 ```
 
 Each commit is replayed one at a time. Conflicts are localized to the specific
-commit that touched the affected lines — resolve it there and continue.
+commit that touched the affected lines — resolve it there and continue. Do not push unless the user explicitly requests a push.
 
 ---
 
 ## Rules
 
-1. **NEVER add raw commits** without a topic prefix. Every commit must be
+1. **NEVER stage, commit, rebase, autosquash, or push** unless the user explicitly requests that git operation.
+
+2. **NEVER add raw commits** without a topic prefix. Every commit must be
    `feat(<area>):`, `fix(<area>):`, or `fixup! <exact target commit message>`.
 
-2. **NEVER merge branches into dev.** Dev is a linear rebase-only branch.
+3. **NEVER merge branches into dev.** Dev is a linear rebase-only branch.
 
-3. **Always use `--force-with-lease`** when pushing dev (it's a rewritten branch).
+4. **Always use `--force-with-lease`** when the user explicitly requests pushing dev (it's a rewritten branch).
 
-4. **One commit per feature area.** If you're fixing something in an existing
-   area, use `fixup!` + autosquash to fold it back in.
+5. **One commit per feature area.** If you're fixing something in an existing
+   area and the user explicitly requests autosquash, use `fixup!` + autosquash to fold it back in.
 
-5. **Keep the stack ordered.** Independent providers come first, shared
+6. **Keep the stack ordered.** Independent providers come first, shared
    infrastructure (`core`) in the middle, cross-cutting features (`tui`,
    `model-routing`, `copilot`) at the end.
 
-6. **When a rebase conflict occurs during autosquash**, stop and resolve it
+7. **When a rebase conflict occurs during an explicitly requested autosquash**, stop and resolve it
    carefully. You can always compare with the current file content using
    `git stash` to save your work and inspect.
 
-7. **Always lint Python files before committing.** Run `uv run python3 -m py_compile
+8. **Always lint Python files before committing.** Run `uv run python3 -m py_compile
    <file>` and `uv run ruff check <file> --select F401,F811,F821,E9` on every file
    you changed. The pre-commit hook enforces this automatically, but treat it
    as a manual checklist item too — catching errors before `git add` is faster
    than fixing a broken deployment.
 
-8. **Keep topic prefixes stable.** The automated release changelog uses commit
+9. **Keep topic prefixes stable.** The automated release changelog uses commit
    messages as feature identifiers. Renaming a topic prefix (e.g.
    `feat(codex):` → `feat(openai-codex):`) causes the release notes to show
    both a "removed" entry and a "new" entry. If a rename is intentional, do it
@@ -189,18 +180,20 @@ git log --oneline upstream/dev..HEAD
 # Find which commit owns a file
 git log --oneline upstream/dev..HEAD -- path/to/file.py
 
-# Lint changed Python files (run BEFORE git add)
+# Lint changed Python files before completion; also before git add if committing was requested
 uv run python3 -m py_compile src/path/to/file.py
 uv run ruff check src/path/to/file.py --select F401,F811,F821,E9
 
-# Make a fix and fold it in
+# Commit only when explicitly requested
 git commit -m "fixup! <exact commit message from git log>"
+
+# Autosquash/rebase only when explicitly requested
 GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash upstream/dev
 
-# Sync with upstream
+# Sync with upstream only when explicitly requested
 git fetch upstream && git rebase upstream/dev
 
-# Push
+# Push only when explicitly requested
 git push origin dev --force-with-lease
 ```
 
