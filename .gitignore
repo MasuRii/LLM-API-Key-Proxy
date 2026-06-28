@@ -151,4 +151,5 @@ tests/*
 !tests/test_classifier_scoped_routing.py
 !tests/test_session_tracking.py
 !tests/test_selection_engine.py
+!tests/test_umans_quota_tracker.py
 docs/ignored/
