@@ -12,9 +12,11 @@ import {
   deleteApiKey,
   deleteOAuthCredential,
   addCustomProvider,
+  batchDeleteCredentials,
   type CredentialSummary,
   type ApiKeyInfo,
   type OAuthInfo,
+  type CredentialBatchDeleteResponse,
 } from "@/api/config"
 import {
   getOAuthProviders,
@@ -38,43 +40,149 @@ export function Credentials() {
   const [deleting, setDeleting] = useState<string | null>(null)
   const [filter, setFilter] = useState<CredFilter>("all")
 
-  const handleDeleteApiKey = useCallback(async (provider: string, keyName: string) => {
-    if (!confirm(`Delete API key ${keyName} for ${provider}?`)) return
-    setDeleting(keyName)
-    try {
-      await deleteApiKey(provider, keyName)
-      await refresh()
-    } finally {
-      setDeleting(null)
-    }
-  }, [refresh])
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [singleDelete, setSingleDelete] = useState<{
+    type: "api_key" | "oauth"
+    provider: string
+    keyName?: string
+    filename?: string
+    maskedValue?: string
+    email?: string
+  } | null>(null)
 
-  const handleDeleteOAuth = useCallback(async (provider: string, filename: string) => {
-    if (!confirm(`Delete OAuth credential ${filename}?`)) return
-    setDeleting(filename)
-    try {
-      await deleteOAuthCredential(provider, filename)
-      await refresh()
-    } finally {
-      setDeleting(null)
-    }
-  }, [refresh])
+  const [batchDialogOpen, setBatchDialogOpen] = useState(false)
+  const [batchResult, setBatchResult] = useState<CredentialBatchDeleteResponse | null>(null)
+  const [batchStage, setBatchStage] = useState<"dry-run" | "executed">("dry-run")
+  const [batchLoading, setBatchLoading] = useState(false)
 
-  const apiKeyCount = Object.values(data?.api_keys ?? {}).reduce((sum, keys) => sum + keys.length, 0)
-  const oauthCount = Object.values(data?.oauth ?? {}).reduce((sum, creds) => sum + creds.length, 0)
+  const [cleanupOpen, setCleanupOpen] = useState(false)
+  const [cleanupStatuses, setCleanupStatuses] = useState<string[]>(["needs_reauth", "cooldown", "exhausted"])
+  const [cleanupPreview, setCleanupPreview] = useState<CredentialSummary | null>(null)
+
+  const currentData = cleanupPreview ?? data
+
+  useEffect(() => {
+    setSelected(new Set())
+  }, [filter])
+
+  const toggleSelection = useCallback((id: string, checked: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (checked) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }, [])
+
+  const handleConfirmSingleDelete = useCallback(async () => {
+    if (!singleDelete) return
+    if (singleDelete.type === "api_key" && singleDelete.keyName) {
+      setDeleting(singleDelete.keyName)
+      try {
+        await deleteApiKey(singleDelete.provider, singleDelete.keyName)
+        setSingleDelete(null)
+        await refresh()
+      } finally {
+        setDeleting(null)
+      }
+    } else if (singleDelete.type === "oauth" && singleDelete.filename) {
+      setDeleting(singleDelete.filename)
+      try {
+        await deleteOAuthCredential(singleDelete.provider, singleDelete.filename)
+        setSingleDelete(null)
+        await refresh()
+      } finally {
+        setDeleting(null)
+      }
+    }
+  }, [singleDelete, refresh])
+
+  const handleDeleteSelected = useCallback(async () => {
+    if (selected.size === 0) return
+    setBatchDialogOpen(true)
+    setBatchStage("dry-run")
+    setBatchLoading(true)
+    try {
+      const items = Array.from(selected).map((id) => {
+        const [type, provider, ...rest] = id.split(":")
+        const identifier = rest.join(":")
+        if (type === "api_key") {
+          return { type: "api_key" as const, provider, key_name: identifier }
+        }
+        return { type: "oauth" as const, provider, filename: identifier }
+      })
+      const result = await batchDeleteCredentials({ dry_run: true, confirm: false, items })
+      setBatchResult(result)
+    } catch (err) {
+      setBatchResult({
+        dry_run: true,
+        candidates: [],
+        deleted: [],
+        errors: [{ type: "unknown", identifier: "batch", detail: err instanceof Error ? err.message : "Failed to preview delete" }],
+      })
+    } finally {
+      setBatchLoading(false)
+    }
+  }, [selected])
+
+  const handleConfirmBatchDelete = useCallback(async () => {
+    if (selected.size === 0) return
+    setBatchLoading(true)
+    try {
+      const items = Array.from(selected).map((id) => {
+        const [type, provider, ...rest] = id.split(":")
+        const identifier = rest.join(":")
+        if (type === "api_key") {
+          return { type: "api_key" as const, provider, key_name: identifier }
+        }
+        return { type: "oauth" as const, provider, filename: identifier }
+      })
+      const result = await batchDeleteCredentials({ dry_run: false, confirm: true, items })
+      setBatchResult(result)
+      setBatchStage("executed")
+      setSelected(new Set())
+      await refresh()
+    } catch (err) {
+      setBatchResult({
+        dry_run: false,
+        candidates: [],
+        deleted: [],
+        errors: [{ type: "unknown", identifier: "batch", detail: err instanceof Error ? err.message : "Failed to execute delete" }],
+      })
+      setBatchStage("executed")
+    } finally {
+      setBatchLoading(false)
+    }
+  }, [selected, refresh])
+
+  const handleCleanupPreview = useCallback(async () => {
+    try {
+      const result = await getCredentials({ status: cleanupStatuses })
+      setCleanupPreview(result)
+      setCleanupOpen(false)
+    } catch {
+      // preview failure is non-critical
+    }
+  }, [cleanupStatuses])
+
+  const apiKeyCount = Object.values(currentData?.api_keys ?? {}).reduce((sum, keys) => sum + keys.length, 0)
+  const oauthCount = Object.values(currentData?.oauth ?? {}).reduce((sum, creds) => sum + creds.length, 0)
 
   const allProviders = [...new Set([
-    ...Object.keys(data?.api_keys ?? {}),
-    ...Object.keys(data?.oauth ?? {}),
+    ...Object.keys(currentData?.api_keys ?? {}),
+    ...Object.keys(currentData?.oauth ?? {}),
   ])].sort().filter((provider) => {
-    if (filter === "api_key") return (data?.api_keys[provider]?.length ?? 0) > 0
-    if (filter === "oauth") return (data?.oauth[provider]?.length ?? 0) > 0
+    if (filter === "api_key") return (currentData?.api_keys[provider]?.length ?? 0) > 0
+    if (filter === "oauth") return (currentData?.oauth[provider]?.length ?? 0) > 0
     return true
   })
 
+  const anyDialogOpen = !!singleDelete || batchDialogOpen || cleanupOpen || addKeyOpen || addCustomOpen || addOAuthOpen
+
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
+    <>
+      <div className="space-y-6" aria-hidden={anyDialogOpen}>
+        <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Credentials</h1>
           <p className="text-muted-foreground">Manage API keys and OAuth credentials</p>
@@ -99,7 +207,7 @@ export function Credentials() {
         </div>
       </div>
 
-      <div className="flex flex-wrap gap-1.5">
+      <div className="flex flex-wrap gap-1.5 items-center">
         <Button
           variant={filter === "all" ? "default" : "outline"}
           size="sm"
@@ -127,11 +235,24 @@ export function Credentials() {
           OAuth
           <Badge variant="secondary" className="ml-1.5 text-[10px] h-4 px-1">{oauthCount}</Badge>
         </Button>
+        <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setCleanupOpen(true)}>
+          Cleanup
+        </Button>
+        {selected.size > 0 && (
+          <div className="flex items-center gap-2 ml-auto">
+            <Button variant="destructive" size="sm" className="h-7 text-xs" onClick={handleDeleteSelected}>
+              Delete selected
+            </Button>
+            <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => setSelected(new Set())}>
+              Clear
+            </Button>
+          </div>
+        )}
       </div>
 
       {allProviders.map((provider) => {
-        const apiKeys = filter !== "oauth" ? (data?.api_keys[provider] ?? []) : []
-        const oauthCreds = (filter !== "api_key" ? (data?.oauth[provider] ?? []) : [])
+        const apiKeys = filter !== "oauth" ? (currentData?.api_keys[provider] ?? []) : []
+        const oauthCreds = (filter !== "api_key" ? (currentData?.oauth[provider] ?? []) : [])
           .slice()
           .sort((a, b) => (a.number ?? Infinity) - (b.number ?? Infinity))
         if (apiKeys.length === 0 && oauthCreds.length === 0) return null
@@ -155,6 +276,13 @@ export function Credentials() {
                 {apiKeys.map((key: ApiKeyInfo) => (
                   <div key={key.key_name} className="flex items-center justify-between py-1.5 px-3 rounded-md bg-muted/50">
                     <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        className="h-3.5 w-3.5 rounded border-muted-foreground"
+                        aria-label={`Select ${key.key_name}`}
+                        checked={selected.has(`api_key:${provider}:${key.key_name}`)}
+                        onChange={(e) => toggleSelection(`api_key:${provider}:${key.key_name}`, e.target.checked)}
+                      />
                       <KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
                       <span className="text-sm font-mono">{key.key_name}</span>
                       <span className="text-xs text-muted-foreground">{key.masked_value}</span>
@@ -163,7 +291,7 @@ export function Credentials() {
                       variant="ghost"
                       size="icon"
                       className="h-7 w-7"
-                      onClick={() => handleDeleteApiKey(provider, key.key_name)}
+                      onClick={() => setSingleDelete({ type: "api_key", provider, keyName: key.key_name, maskedValue: key.masked_value })}
                       disabled={deleting === key.key_name}
                     >
                       <Trash2 className="h-3.5 w-3.5 text-destructive" />
@@ -191,6 +319,13 @@ export function Credentials() {
                       }`}
                     >
                       <div className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          className="h-3.5 w-3.5 rounded border-muted-foreground"
+                          aria-label={`Select ${cred.filename}`}
+                          checked={selected.has(`oauth:${provider}:${cred.filename}`)}
+                          onChange={(e) => toggleSelection(`oauth:${provider}:${cred.filename}`, e.target.checked)}
+                        />
                         {isInvalid && <AlertCircle className={`h-3.5 w-3.5 shrink-0 ${isError ? "text-destructive" : "text-warning"}`} />}
                         <Badge variant="outline" className="text-[10px]">OAuth</Badge>
                         {cred.number != null && (
@@ -221,7 +356,7 @@ export function Credentials() {
                         variant="ghost"
                         size="icon"
                         className="h-7 w-7"
-                        onClick={() => handleDeleteOAuth(provider, cred.filename)}
+                        onClick={() => setSingleDelete({ type: "oauth", provider, filename: cred.filename, email: cred.email })}
                         disabled={deleting === cred.filename}
                       >
                         <Trash2 className="h-3.5 w-3.5 text-destructive" />
@@ -245,11 +380,120 @@ export function Credentials() {
           </CardContent>
         </Card>
       )}
+      </div>
+
+      <Dialog open={!!singleDelete} onOpenChange={(open) => { if (!open) setSingleDelete(null) }} aria-label={singleDelete?.type === "api_key" ? "Delete API Key" : "Delete OAuth Credential"}>
+        <DialogContent onClose={() => setSingleDelete(null)}>
+          <DialogHeader>
+            <DialogTitle>{singleDelete?.type === "api_key" ? "Delete API Key" : "Delete OAuth Credential"}</DialogTitle>
+            <DialogDescription>This deletion is local-only and does not revoke upstream provider access.</DialogDescription>
+          </DialogHeader>
+          {singleDelete && (
+            <div className="space-y-1 mt-2">
+              <p className="text-sm">Provider: {singleDelete.provider}</p>
+              {singleDelete.keyName && (
+                <>
+                  <p className="text-sm">Name: {singleDelete.keyName}</p>
+                  {singleDelete.maskedValue && (
+                    <p className="text-sm">Value: {singleDelete.maskedValue}</p>
+                  )}
+                </>
+              )}
+              {singleDelete.filename && (
+                <>
+                  <p className="text-sm">File: {singleDelete.filename}</p>
+                  {singleDelete.email && (
+                    <p className="text-sm">Account: {singleDelete.email}</p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+          <div className="flex justify-end gap-2 mt-4">
+            <Button variant="outline" onClick={() => setSingleDelete(null)}>Cancel</Button>
+            <Button variant="destructive" onClick={handleConfirmSingleDelete} disabled={deleting !== null}>
+              {deleting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+              Delete
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={batchDialogOpen} onOpenChange={setBatchDialogOpen} aria-label="Batch Delete Credentials">
+        <DialogContent onClose={() => setBatchDialogOpen(false)}>
+          <DialogHeader>
+            <DialogTitle>Delete Selected Credentials</DialogTitle>
+            <DialogDescription>This deletion is local-only and does not revoke upstream provider access.</DialogDescription>
+          </DialogHeader>
+          {batchLoading && (
+            <div className="flex items-center justify-center gap-2 py-4">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              <span className="text-sm text-muted-foreground">Processing...</span>
+            </div>
+          )}
+          {!batchLoading && batchStage === "dry-run" && batchResult && (
+            <div className="space-y-3 mt-2">
+              <p className="text-sm">{batchResult.candidates.length} credentials ready to delete</p>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" onClick={() => setBatchDialogOpen(false)}>Cancel</Button>
+                <Button variant="destructive" onClick={handleConfirmBatchDelete}>Confirm delete</Button>
+              </div>
+            </div>
+          )}
+          {!batchLoading && batchStage === "executed" && batchResult && (
+            <div className="space-y-2 mt-2">
+              {batchResult.deleted.map((item: any) => (
+                <div key={item.identifier} className="text-sm">
+                  {item.identifier} {item.removed_from_proxy ? "removed from running proxy" : "restart may be needed"}
+                </div>
+              ))}
+              {batchResult.errors.map((err: any) => (
+                <div key={err.identifier} className="text-sm text-destructive">
+                  {err.identifier} {err.detail}
+                </div>
+              ))}
+              <div className="flex justify-end mt-4">
+                <Button variant="outline" onClick={() => setBatchDialogOpen(false)}>Close</Button>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={cleanupOpen} onOpenChange={setCleanupOpen} aria-label="Cleanup Credentials">
+        <DialogContent onClose={() => setCleanupOpen(false)}>
+          <DialogHeader>
+            <DialogTitle>Cleanup Credentials</DialogTitle>
+            <DialogDescription>Select statuses to preview for cleanup.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 mt-2">
+            {["needs_reauth", "cooldown", "exhausted"].map((status) => (
+              <label key={status} className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 rounded border-muted-foreground"
+                  checked={cleanupStatuses.includes(status)}
+                  onChange={(e) => {
+                    setCleanupStatuses((prev) =>
+                      e.target.checked ? [...prev, status] : prev.filter((s) => s !== status)
+                    )
+                  }}
+                />
+                {status}
+              </label>
+            ))}
+          </div>
+          <div className="flex justify-end gap-2 mt-4">
+            <Button variant="outline" onClick={() => setCleanupOpen(false)}>Cancel</Button>
+            <Button onClick={handleCleanupPreview}>Preview</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <AddOAuthDialog open={addOAuthOpen} onOpenChange={setAddOAuthOpen} onSuccess={refresh} />
       <AddApiKeyDialog open={addKeyOpen} onOpenChange={setAddKeyOpen} onSuccess={refresh} />
       <AddCustomProviderDialog open={addCustomOpen} onOpenChange={setAddCustomOpen} onSuccess={refresh} />
-    </div>
+    </>
   )
 }
 

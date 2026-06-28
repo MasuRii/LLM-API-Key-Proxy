@@ -65,8 +65,40 @@ export async function updateConfig(changes: Record<string, string | null>): Prom
   })
 }
 
-export async function getCredentials(): Promise<CredentialSummary> {
-  return apiFetch("/v1/admin/credentials")
+export interface CredentialBatchDeleteRequest {
+  items: Array<
+    | { type: "api_key"; provider: string; key_name: string }
+    | { type: "oauth"; provider: string; filename: string }
+  >
+  dry_run: boolean
+  confirm: boolean
+}
+
+export interface CredentialBatchDeleteResponse {
+  dry_run: boolean
+  candidates: Array<Record<string, unknown>>
+  deleted: Array<Record<string, unknown>>
+  errors: Array<Record<string, unknown>>
+}
+
+export async function getCredentials(filters?: { status?: string[] }): Promise<CredentialSummary> {
+  const params = new URLSearchParams()
+  if (filters?.status) {
+    for (const s of filters.status) {
+      params.append("status", s)
+    }
+  }
+  const query = params.toString()
+  return apiFetch(`/v1/admin/credentials${query ? `?${query}` : ""}`)
+}
+
+export async function batchDeleteCredentials(
+  request: CredentialBatchDeleteRequest
+): Promise<CredentialBatchDeleteResponse> {
+  return apiFetch("/v1/admin/credentials/batch-delete", {
+    method: "POST",
+    body: JSON.stringify(request),
+  })
 }
 
 export async function addApiKey(provider: string, key: string): Promise<{ key_name: string }> {

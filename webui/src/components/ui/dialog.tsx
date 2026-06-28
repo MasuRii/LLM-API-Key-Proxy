@@ -6,9 +6,11 @@ interface DialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   children: React.ReactNode
+  "aria-label"?: string
+  "aria-labelledby"?: string
 }
 
-function Dialog({ open, onOpenChange, children }: DialogProps) {
+function Dialog({ open, onOpenChange, children, "aria-label": ariaLabel, "aria-labelledby": ariaLabelledBy }: DialogProps) {
   React.useEffect(() => {
     if (!open) return
     const handler = (e: KeyboardEvent) => {
@@ -21,7 +23,7 @@ function Dialog({ open, onOpenChange, children }: DialogProps) {
   if (!open) return null
 
   return (
-    <div className="fixed inset-0 z-50" role="dialog" aria-modal="true">
+    <div className="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-label={ariaLabel} aria-labelledby={ariaLabelledBy}>
       <div className="fixed inset-0 bg-black/80" onClick={() => onOpenChange(false)} />
       <div className="fixed inset-0 flex items-center justify-center p-4">
         {children}

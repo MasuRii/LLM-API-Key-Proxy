@@ -1,14 +1,16 @@
 """Admin API for proxy configuration and credential management."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from dotenv import load_dotenv
@@ -106,6 +108,282 @@ def _mask_key(value: str) -> str:
     if len(value) <= 8:
         return "***"
     return value[:4] + "..." + value[-4:]
+
+
+@dataclass(frozen=True)
+class CredentialDeletionCandidate:
+    type: str
+    provider: str
+    identifier: str
+    key_name: Optional[str] = None
+    filename: Optional[str] = None
+    key_value: Optional[str] = None
+    target: Optional[Path] = None
+    stable_id: Optional[str] = None
+    usage_accessors: tuple[str, ...] = ()
+    usage_filenames: tuple[str, ...] = ()
+
+
+def _api_key_provider_from_name(key_name: str) -> Optional[str]:
+    if key_name.startswith("PROXY_"):
+        return None
+    match = re.fullmatch(r"(.+?)_API_KEY(?:_\d+)?", key_name)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+def _oauth_provider_from_filename(filename: str) -> Optional[str]:
+    match = re.fullmatch(r"(.+?)_oauth_\d+\.json", filename)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+def _normalize_status_filter(statuses: Optional[list[str]]) -> set[str]:
+    selected: set[str] = set()
+    for value in statuses or []:
+        selected.update(part.strip().lower() for part in value.split(",") if part.strip())
+    return selected
+
+
+def _api_key_stable_id_from_value(key_value: str) -> str:
+    return hashlib.sha256(key_value.encode()).hexdigest()[:12]
+
+
+def _oauth_stable_id_from_payload(data: dict) -> str:
+    metadata = data.get("_proxy_metadata", {}) if isinstance(data, dict) else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    stable = metadata.get("login") or metadata.get("email")
+    if not stable:
+        for field in ("login", "email", "client_email", "account"):
+            if data.get(field):
+                stable = data[field]
+                break
+    if not stable:
+        return ""
+
+    account_id = data.get("account_id") or metadata.get("account_id")
+    return f"{stable}::{account_id}" if account_id else str(stable)
+
+
+def _oauth_stable_id_from_file(path: Path) -> str:
+    try:
+        return _oauth_stable_id_from_payload(_read_json(path))
+    except Exception:
+        return ""
+
+
+def _oauth_number_from_filename(filename: str) -> str:
+    match = re.fullmatch(r".+?_oauth_(\d+)\.json", filename)
+    return match.group(1) if match else ""
+
+
+def _cleanup_usage_for_deleted_candidate(candidate: CredentialDeletionCandidate) -> dict:
+    payload = {
+        "type": candidate.type,
+        "provider": candidate.provider,
+        "identifier": candidate.identifier,
+        "stable_id": candidate.stable_id or "",
+        "usage_accessors": list(candidate.usage_accessors),
+        "usage_filenames": list(candidate.usage_filenames),
+    }
+    if candidate.key_name:
+        payload["key_name"] = candidate.key_name
+    if candidate.filename:
+        payload["filename"] = candidate.filename
+    if candidate.target:
+        payload["file_path"] = str(candidate.target)
+
+    try:
+        from rotator_library.credential_tool import _cleanup_deleted_credential_usage
+
+        return _cleanup_deleted_credential_usage(payload)
+    except Exception as exc:
+        return {
+            "success": False,
+            "files_scanned": 0,
+            "files_updated": 0,
+            "removed_credentials": 0,
+            "removed_accessors": 0,
+            "leftovers": [],
+            "errors": [f"usage cleanup failed: {exc}"],
+        }
+
+
+def _validate_api_key_candidate(
+    provider: str,
+    key_name: Optional[str],
+    env_vars: dict[str, str],
+) -> CredentialDeletionCandidate:
+    provider_lower = provider.lower()
+    if not key_name:
+        raise HTTPException(status_code=400, detail="key_name is required for API key deletion")
+    if key_name not in env_vars:
+        raise HTTPException(status_code=404, detail=f"Key {key_name} not found")
+
+    key_provider = _api_key_provider_from_name(key_name)
+    if key_provider != provider_lower:
+        raise HTTPException(
+            status_code=400,
+            detail=f"API key {key_name} does not belong to provider {provider_lower}",
+        )
+
+    key_value = env_vars[key_name]
+    return CredentialDeletionCandidate(
+        type="api_key",
+        provider=provider_lower,
+        identifier=key_name,
+        key_name=key_name,
+        key_value=key_value,
+        stable_id=_api_key_stable_id_from_value(key_value),
+    )
+
+
+def _validate_oauth_candidate(
+    provider: str,
+    filename: Optional[str],
+    oauth_dir: Path,
+) -> CredentialDeletionCandidate:
+    provider_lower = provider.lower()
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required for OAuth deletion")
+    if Path(filename).name != filename or "\\" in filename:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    target = oauth_dir / filename
+    try:
+        if not target.resolve().is_relative_to(oauth_dir.resolve()):
+            raise HTTPException(status_code=403, detail="Access denied")
+    except OSError as exc:
+        raise HTTPException(status_code=403, detail="Access denied") from exc
+
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="OAuth credential not found")
+
+    file_provider = _oauth_provider_from_filename(filename)
+    if file_provider != provider_lower:
+        raise HTTPException(
+            status_code=400,
+            detail=f"OAuth credential {filename} does not belong to provider {provider_lower}",
+        )
+
+    credential_number = _oauth_number_from_filename(filename)
+    usage_accessors = [str(target)]
+    if credential_number:
+        usage_accessors.append(f"env://{provider_lower}/{credential_number}")
+
+    return CredentialDeletionCandidate(
+        type="oauth",
+        provider=provider_lower,
+        identifier=filename,
+        filename=filename,
+        target=target,
+        stable_id=_oauth_stable_id_from_file(target),
+        usage_accessors=tuple(usage_accessors),
+        usage_filenames=(filename,),
+    )
+
+
+def _candidate_response(candidate: CredentialDeletionCandidate, **extra: object) -> dict:
+    item = {
+        "type": candidate.type,
+        "provider": candidate.provider,
+        "identifier": candidate.identifier,
+    }
+    if candidate.key_name:
+        item["key_name"] = candidate.key_name
+    if candidate.filename:
+        item["filename"] = candidate.filename
+    item.update(extra)
+    return item
+
+
+def _item_identifier(item: "CredentialBatchDeleteItem") -> str:
+    if item.type == "api_key":
+        return item.key_name or ""
+    if item.type == "oauth":
+        return item.filename or ""
+    return item.key_name or item.filename or ""
+
+
+def _remove_api_key_from_runtime(
+    request: Request,
+    provider_lower: str,
+    key_value: Optional[str],
+) -> bool:
+    if key_value is None:
+        return False
+
+    removed_from_proxy = False
+    try:
+        client = request.app.state.rotating_client
+        if provider_lower in client.all_credentials:
+            before = len(client.all_credentials[provider_lower])
+            client.all_credentials[provider_lower] = [
+                c for c in client.all_credentials[provider_lower]
+                if c != key_value
+            ]
+            removed_from_proxy = len(client.all_credentials[provider_lower]) < before
+        if provider_lower in client.api_keys:
+            before = len(client.api_keys[provider_lower])
+            client.api_keys[provider_lower] = [
+                c for c in client.api_keys[provider_lower]
+                if c != key_value
+            ]
+            removed_from_proxy = removed_from_proxy or len(client.api_keys[provider_lower]) < before
+    except Exception as e:
+        logger.warning(f"Could not remove API key from running proxy: {e}")
+    return removed_from_proxy
+
+
+def _remove_oauth_from_runtime(request: Request, provider_lower: str, filename: str) -> bool:
+    removed_from_proxy = False
+    try:
+        client = request.app.state.rotating_client
+        if provider_lower in client.all_credentials:
+            before = len(client.all_credentials[provider_lower])
+            client.all_credentials[provider_lower] = [
+                c for c in client.all_credentials[provider_lower]
+                if not str(c).endswith(filename)
+            ]
+            removed_from_proxy = len(client.all_credentials[provider_lower]) < before
+        if provider_lower in client.oauth_credentials:
+            before = len(client.oauth_credentials[provider_lower])
+            client.oauth_credentials[provider_lower] = [
+                c for c in client.oauth_credentials[provider_lower]
+                if not str(c).endswith(filename)
+            ]
+            removed_from_proxy = removed_from_proxy or len(
+                client.oauth_credentials[provider_lower]
+            ) < before
+    except Exception as e:
+        logger.warning(f"Could not remove credential from running proxy: {e}")
+    return removed_from_proxy
+
+
+def _delete_api_key_candidate(
+    candidate: CredentialDeletionCandidate,
+    request: Request,
+) -> bool:
+    if not candidate.key_name:
+        raise HTTPException(status_code=400, detail="key_name is required for API key deletion")
+
+    env_file = str(_env_path())
+    _inplace_unset_key(env_file, candidate.key_name)
+    os.environ.pop(candidate.key_name, None)
+    load_dotenv(env_file, override=True)
+    return _remove_api_key_from_runtime(request, candidate.provider, candidate.key_value)
+
+
+def _delete_oauth_candidate(candidate: CredentialDeletionCandidate, request: Request) -> bool:
+    if not candidate.filename or not candidate.target:
+        raise HTTPException(status_code=400, detail="filename is required for OAuth deletion")
+
+    candidate.target.unlink()
+    return _remove_oauth_from_runtime(request, candidate.provider, candidate.filename)
 
 
 @router.get("/config")
@@ -227,6 +505,15 @@ class ConfigUpdate(BaseModel):
     changes: dict[str, Optional[str]]
 
 
+class CredentialHealthClearRequest(BaseModel):
+    confirm: bool = False
+    reason: str = Field(
+        default="manual_reauth_completed",
+        pattern=r"^[a-zA-Z0-9_\-]+$",
+        max_length=80,
+    )
+
+
 _CONFIG_BLOCKED_KEYS = {"PROXY_API_KEY", "PATH", "HOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH"}
 _CONFIG_ALLOWED_PREFIXES = (
     "ROTATION_MODE_", "MAX_CONCURRENT_REQUESTS_PER_KEY_", "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_",
@@ -262,7 +549,11 @@ async def update_config(update: ConfigUpdate):
 
 
 @router.get("/credentials")
-async def get_credentials(request: Request):
+async def get_credentials(
+    request: Request,
+    status: Optional[list[str]] = Query(default=None),
+):
+    status_filter = _normalize_status_filter(status)
     env_vars = _get_env_vars()
     oauth_dir = _oauth_dir()
 
@@ -295,25 +586,24 @@ async def get_credentials(request: Request):
         pass
 
     api_keys: dict[str, list] = {}
-    for key, value in env_vars.items():
-        api_key_match = re.match(r"^(.+?)_API_KEY(?:_\d+)?$", key)
-        if api_key_match and not key.startswith("PROXY_"):
-            provider_name = api_key_match.group(1).lower()
-            if provider_name not in api_keys:
-                api_keys[provider_name] = []
-            api_keys[provider_name].append({
-                "key_name": key,
-                "masked_value": _mask_key(value),
-                "provider": provider_name,
-            })
+    if not status_filter:
+        for key, value in env_vars.items():
+            api_key_match = re.match(r"^(.+?)_API_KEY(?:_\d+)?$", key)
+            if api_key_match and not key.startswith("PROXY_"):
+                provider_name = api_key_match.group(1).lower()
+                if provider_name not in api_keys:
+                    api_keys[provider_name] = []
+                api_keys[provider_name].append({
+                    "key_name": key,
+                    "masked_value": _mask_key(value),
+                    "provider": provider_name,
+                })
 
     oauth: dict[str, list] = {}
     if oauth_dir.exists():
         for f in sorted(oauth_dir.iterdir()):
             if f.is_file() and f.suffix == ".json" and "_oauth_" in f.name:
                 provider_name = f.name.split("_oauth_")[0].lower()
-                if provider_name not in oauth:
-                    oauth[provider_name] = []
                 # Extract number from filename (e.g. codex_oauth_2.json -> 2)
                 num_match = re.search(r"_oauth_(\d+)\.json$", f.name)
                 cred_number = int(num_match.group(1)) if num_match else None
@@ -328,9 +618,11 @@ async def get_credentials(request: Request):
                     info["email"] = meta.get("email") or meta.get("login") or data.get("email")
                     info["tier"] = meta.get("tier") or meta.get("plan_type") or meta.get("sku")
                     file_status = meta.get("status", "unknown")
-                    # Runtime status takes precedence, then file metadata,
-                    # then infer "active" if the provider is loaded in the proxy
-                    resolved = runtime_status.get(f.name)
+                    # Durable file/usage health is authoritative for manual
+                    # reauth; runtime quota status cannot make it active.
+                    resolved = "needs_reauth" if file_status == "needs_reauth" else None
+                    if not resolved:
+                        resolved = runtime_status.get(f.name)
                     if not resolved:
                         if file_status and file_status != "unknown":
                             resolved = file_status
@@ -344,7 +636,8 @@ async def get_credentials(request: Request):
                     info["status"] = resolved
                 except Exception:
                     info["status"] = runtime_status.get(f.name, "error")
-                oauth[provider_name].append(info)
+                if not status_filter or str(info["status"]).lower() in status_filter:
+                    oauth.setdefault(provider_name, []).append(info)
 
     return {"api_keys": api_keys, "oauth": oauth}
 
@@ -352,6 +645,19 @@ async def get_credentials(request: Request):
 class AddApiKeyRequest(BaseModel):
     provider: str = Field(pattern=r"^[a-zA-Z0-9_]+$", min_length=1, max_length=50)
     key: str = Field(min_length=1, max_length=500)
+
+
+class CredentialBatchDeleteItem(BaseModel):
+    type: str = Field(pattern=r"^(api_key|oauth)$")
+    provider: str = Field(pattern=r"^[a-zA-Z0-9_]+$", min_length=1, max_length=50)
+    key_name: Optional[str] = None
+    filename: Optional[str] = None
+
+
+class CredentialBatchDeleteRequest(BaseModel):
+    items: list[CredentialBatchDeleteItem] = Field(default_factory=list)
+    dry_run: bool = True
+    confirm: bool = False
 
 
 @router.post("/credentials/api-key")
@@ -381,70 +687,181 @@ async def add_api_key(req: AddApiKeyRequest):
     return {"key_name": key_name}
 
 
+@router.post("/credentials/batch-delete")
+async def batch_delete_credentials(req: CredentialBatchDeleteRequest, request: Request):
+    if not req.items:
+        raise HTTPException(status_code=400, detail="At least one credential is required")
+    if not req.dry_run and not req.confirm:
+        raise HTTPException(status_code=400, detail="confirm must be true to delete credentials")
+
+    async with _credential_lock:
+        env_vars = _get_env_vars()
+        oauth_dir = _oauth_dir()
+        candidates = []
+        errors = []
+        seen: set[tuple[str, str, str]] = set()
+
+        for item in req.items:
+            try:
+                if item.type == "api_key":
+                    candidate = _validate_api_key_candidate(item.provider, item.key_name, env_vars)
+                else:
+                    candidate = _validate_oauth_candidate(item.provider, item.filename, oauth_dir)
+
+                duplicate_key = (candidate.type, candidate.provider, candidate.identifier)
+                if duplicate_key in seen:
+                    raise HTTPException(status_code=400, detail="Duplicate credential in request")
+                seen.add(duplicate_key)
+                candidates.append(candidate)
+            except HTTPException as exc:
+                errors.append({
+                    "type": item.type,
+                    "provider": item.provider.lower(),
+                    "identifier": _item_identifier(item),
+                    "status_code": exc.status_code,
+                    "detail": exc.detail,
+                })
+
+        if errors:
+            return {
+                "dry_run": req.dry_run,
+                "candidates": [_candidate_response(candidate) for candidate in candidates],
+                "deleted": [],
+                "errors": errors,
+            }
+
+        candidate_results = [_candidate_response(candidate) for candidate in candidates]
+        if req.dry_run:
+            return {
+                "dry_run": True,
+                "candidates": candidate_results,
+                "deleted": [],
+                "errors": [],
+            }
+
+        deleted = []
+        deletion_errors = []
+        for candidate in candidates:
+            if candidate.type == "api_key":
+                removed_from_proxy = _delete_api_key_candidate(candidate, request)
+            else:
+                removed_from_proxy = _delete_oauth_candidate(candidate, request)
+            usage_cleanup = _cleanup_usage_for_deleted_candidate(candidate)
+            deleted.append(
+                _candidate_response(
+                    candidate,
+                    removed_from_proxy=removed_from_proxy,
+                    usage_cleanup=usage_cleanup,
+                )
+            )
+            if not usage_cleanup.get("success"):
+                deletion_errors.append(
+                    {
+                        "type": candidate.type,
+                        "provider": candidate.provider,
+                        "identifier": candidate.identifier,
+                        "detail": "Deleted credential, but usage cleanup reported errors",
+                        "usage_cleanup": usage_cleanup,
+                    }
+                )
+
+    return {
+        "dry_run": False,
+        "candidates": candidate_results,
+        "deleted": deleted,
+        "errors": deletion_errors,
+    }
+
+
 @router.delete("/credentials/api-key/{provider}/{key_name}")
 async def delete_api_key(provider: str, key_name: str, request: Request):
     async with _credential_lock:
-        env_file = str(_env_path())
-        env_vars = _get_env_vars()
-        if key_name not in env_vars:
-            raise HTTPException(status_code=404, detail=f"Key {key_name} not found")
+        candidate = _validate_api_key_candidate(provider, key_name, _get_env_vars())
+        removed_from_proxy = _delete_api_key_candidate(candidate, request)
+        usage_cleanup = _cleanup_usage_for_deleted_candidate(candidate)
 
-        key_value = env_vars[key_name]
-        _inplace_unset_key(env_file, key_name)
-        os.environ.pop(key_name, None)
-        load_dotenv(env_file, override=True)
-
-        try:
-            client = request.app.state.rotating_client
-            provider_lower = provider.lower()
-            if provider_lower in client.all_credentials:
-                client.all_credentials[provider_lower] = [
-                    c for c in client.all_credentials[provider_lower]
-                    if c != key_value
-                ]
-            if provider_lower in client.api_keys:
-                client.api_keys[provider_lower] = [
-                    c for c in client.api_keys[provider_lower]
-                    if c != key_value
-                ]
-        except Exception as e:
-            logger.warning(f"Could not remove API key from running proxy: {e}")
-
-    return {"deleted": key_name}
+    return {
+        "deleted": key_name,
+        "removed_from_proxy": removed_from_proxy,
+        "usage_cleanup": usage_cleanup,
+        "errors": [] if usage_cleanup.get("success") else [
+            {
+                "detail": "Deleted API key, but usage cleanup reported errors",
+                "usage_cleanup": usage_cleanup,
+            }
+        ],
+    }
 
 
 @router.delete("/credentials/oauth/{provider}/{filename}")
 async def delete_oauth_credential(provider: str, filename: str, request: Request):
     async with _credential_lock:
-        oauth_dir = _oauth_dir()
-        target = oauth_dir / filename
-        if not target.exists():
-            raise HTTPException(status_code=404, detail="OAuth credential not found")
-        if not target.resolve().is_relative_to(oauth_dir.resolve()):
-            raise HTTPException(status_code=403, detail="Access denied")
+        candidate = _validate_oauth_candidate(provider, filename, _oauth_dir())
+        removed_from_proxy = _delete_oauth_candidate(candidate, request)
+        usage_cleanup = _cleanup_usage_for_deleted_candidate(candidate)
 
-        target.unlink()
+    return {
+        "deleted": filename,
+        "removed_from_proxy": removed_from_proxy,
+        "usage_cleanup": usage_cleanup,
+        "errors": [] if usage_cleanup.get("success") else [
+            {
+                "detail": "Deleted OAuth credential, but usage cleanup reported errors",
+                "usage_cleanup": usage_cleanup,
+            }
+        ],
+    }
 
-        removed_from_proxy = False
+
+@router.post("/credentials/oauth/{provider}/{filename}/clear-health")
+async def clear_oauth_credential_health(
+    provider: str,
+    filename: str,
+    req: CredentialHealthClearRequest,
+    request: Request,
+):
+    if not req.confirm:
+        raise HTTPException(status_code=400, detail="confirm must be true to clear health")
+
+    async with _credential_lock:
+        candidate = _validate_oauth_candidate(provider, filename, _oauth_dir())
+        assert candidate.target is not None
+
+        data = await asyncio.to_thread(_read_json, candidate.target)
+        metadata = data.setdefault("_proxy_metadata", {})
+        metadata["status"] = "active"
+        metadata["health_cleared_reason"] = req.reason
+
+        def _write_json() -> None:
+            with open(candidate.target, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+
+        await asyncio.to_thread(_write_json)
+
+        runtime_cleared = False
         try:
             client = request.app.state.rotating_client
-            provider_lower = provider.lower()
-            if provider_lower in client.all_credentials:
-                before = len(client.all_credentials[provider_lower])
-                client.all_credentials[provider_lower] = [
-                    c for c in client.all_credentials[provider_lower]
-                    if not c.endswith(filename)
-                ]
-                removed_from_proxy = len(client.all_credentials[provider_lower]) < before
-            if provider_lower in client.oauth_credentials:
-                client.oauth_credentials[provider_lower] = [
-                    c for c in client.oauth_credentials[provider_lower]
-                    if not c.endswith(filename)
-                ]
-        except Exception as e:
-            logger.warning(f"Could not remove credential from running proxy: {e}")
+            if hasattr(client, "clear_credential_health_block"):
+                runtime_cleared = await client.clear_credential_health_block(
+                    candidate.provider,
+                    candidate.filename,
+                )
+            elif hasattr(client, "get_usage_manager"):
+                manager = client.get_usage_manager(candidate.provider)
+                if manager and hasattr(manager, "clear_credential_health_block"):
+                    runtime_cleared = await manager.clear_credential_health_block(
+                        str(candidate.target),
+                        reason=req.reason,
+                    )
+        except Exception as exc:
+            logger.warning("Could not clear runtime credential health: %s", exc)
 
-    return {"deleted": filename, "removed_from_proxy": removed_from_proxy}
+    return {
+        "provider": candidate.provider,
+        "filename": candidate.filename,
+        "status": "active",
+        "cleared_runtime": runtime_cleared,
+    }
 
 
 class AddCustomProviderRequest(BaseModel):
