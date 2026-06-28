@@ -983,6 +983,7 @@ class RequestExecutor:
                     self._log_acquiring_credential(
                         model, len(retry_state.tried_credentials), availability
                     )
+                    acquire_started_at = time.perf_counter()
                     async with await usage_manager.acquire_credential(
                         model=model,
                         quota_group=quota_group,
@@ -992,6 +993,7 @@ class RequestExecutor:
                         priorities=filter_result.priorities,
                         deadline=deadline,
                     ) as cred_context:
+                        acquire_elapsed_ms = (time.perf_counter() - acquire_started_at) * 1000
                         cred = cred_context.credential
                         credential_secret = context.credential_secrets.get(cred, cred)
                         retry_state.record_attempt(cred)
@@ -1001,6 +1003,10 @@ class RequestExecutor:
                         )
                         self._log_acquired_credential(
                             cred, model, state, quota_group, availability, usage_manager
+                        )
+                        lib_logger.info(
+                            f"Stream timing: credential_acquire_ms={acquire_elapsed_ms:.1f} "
+                            f"provider={provider} model={model} credential={mask_credential(cred)}"
                         )
 
                         if context.transaction_logger:
@@ -1048,7 +1054,7 @@ class RequestExecutor:
                                         context, kwargs
                                     )
 
-                                    # Make the API call
+                                    upstream_connect_started_at = time.perf_counter()
                                     if plugin and plugin.has_custom_logic():
                                         kwargs["credential_identifier"] = credential_secret
                                         stream = await plugin.acompletion(
@@ -1062,6 +1068,13 @@ class RequestExecutor:
                                         # Remove internal context before litellm call
                                         kwargs.pop("transaction_context", None)
                                         stream = await litellm.acompletion(**kwargs)
+                                    upstream_connect_elapsed_ms = (
+                                        time.perf_counter() - upstream_connect_started_at
+                                    ) * 1000
+                                    lib_logger.info(
+                                        f"Stream timing: upstream_connect_ms={upstream_connect_elapsed_ms:.1f} "
+                                        f"provider={provider} model={model} credential={mask_credential(cred)}"
+                                    )
 
                                     # Hand off to streaming handler with cred_context
                                     # The handler will call mark_success on completion
@@ -1083,21 +1096,45 @@ class RequestExecutor:
                                         "Processing response."
                                     )
 
+                                    stream_started_at = time.perf_counter()
+                                    first_upstream_logged = False
+                                    first_downstream_logged = False
+                                    chunk_count = 0
+
                                     # Wrap with transaction logging if enabled
                                     if context.transaction_logger:
-                                        async for (
-                                            chunk
-                                        ) in self._transaction_logging_stream_wrapper(
+                                        output_stream = self._transaction_logging_stream_wrapper(
                                             base_stream,
                                             context.transaction_logger,
                                             context.kwargs,
-                                        ):
-                                            last_streamed_chunk = chunk
-                                            yield chunk
+                                        )
                                     else:
-                                        async for chunk in base_stream:
-                                            last_streamed_chunk = chunk
-                                            yield chunk
+                                        output_stream = base_stream
+
+                                    async for chunk in output_stream:
+                                        if not first_upstream_logged:
+                                            first_upstream_logged = True
+                                            lib_logger.info(
+                                                f"Stream timing: first_upstream_chunk_ms="
+                                                f"{(time.perf_counter() - stream_started_at) * 1000:.1f} "
+                                                f"provider={provider} model={model} credential={mask_credential(cred)}"
+                                            )
+                                        last_streamed_chunk = chunk
+                                        yield chunk
+                                        chunk_count += 1
+                                        if not first_downstream_logged:
+                                            first_downstream_logged = True
+                                            lib_logger.info(
+                                                f"Stream timing: first_downstream_yield_ms="
+                                                f"{(time.perf_counter() - stream_started_at) * 1000:.1f} "
+                                                f"provider={provider} model={model} credential={mask_credential(cred)}"
+                                            )
+
+                                    lib_logger.info(
+                                        f"Stream timing: completed_ms={(time.perf_counter() - stream_started_at) * 1000:.1f} "
+                                        f"chunks={chunk_count} provider={provider} model={model} "
+                                        f"credential={mask_credential(cred)}"
+                                    )
                                     return
 
                                 except StreamedAPIError as e:

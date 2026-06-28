@@ -824,7 +824,8 @@ async def streaming_response_wrapper(
     Wraps a streaming response to log the full response after completion
     and ensures any errors during the stream are sent to the client.
     """
-    response_chunks = []
+    collect_response_chunks = logger is not None
+    response_chunks = [] if collect_response_chunks else None
     full_response = {}
 
     try:
@@ -833,14 +834,13 @@ async def streaming_response_wrapper(
                 logging.warning("Client disconnected, stopping stream.")
                 break
             yield chunk_str
-            if chunk_str.strip() and chunk_str.startswith("data:"):
+            if collect_response_chunks and chunk_str.strip() and chunk_str.startswith("data:"):
                 content = chunk_str[len("data:") :].strip()
                 if content != "[DONE]":
                     try:
                         chunk_data = json.loads(content)
                         response_chunks.append(chunk_data)
-                        if logger:
-                            logger.log_stream_chunk(chunk_data)
+                        logger.log_stream_chunk(chunk_data)
                     except json.JSONDecodeError:
                         pass
     except Exception as e:
@@ -862,7 +862,7 @@ async def streaming_response_wrapper(
             )
         return  # Stop further processing
     finally:
-        if response_chunks:
+        if collect_response_chunks and response_chunks:
             # --- Aggregation Logic ---
             final_message = {"role": "assistant"}
             aggregated_tool_calls = {}
