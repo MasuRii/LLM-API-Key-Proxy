@@ -85,6 +85,7 @@ PROVIDER_ALIASES = {
     "gemini_cli": ["google"],
     "gemini": ["google"],
     "opencode_go": ["opencode"],
+    "x-ai": ["xai"],
 }
 
 
