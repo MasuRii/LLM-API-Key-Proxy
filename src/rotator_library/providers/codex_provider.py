@@ -362,6 +362,9 @@ def _is_usage_limit_error(error_text: str) -> bool:
 # chat completion format instead of the Responses API's structured output.
 GARBLED_TOOL_CALL_MAX_RETRIES = max(1, env_int("CODEX_GARBLED_TOOL_CALL_RETRIES", 3))
 GARBLED_TOOL_CALL_RETRY_DELAY = env_int("CODEX_GARBLED_TOOL_CALL_RETRY_DELAY", 1)
+GARBLED_TOOL_CALL_RETRY_BEFORE_FIRST_OUTPUT = env_bool(
+    "CODEX_GARBLED_TOOL_CALL_RETRY_BEFORE_FIRST_OUTPUT", False
+)
 
 # Multiple detection markers — if ANY match, the stream is considered garbled.
 # The "to=functions." pattern is the universal signature across all variants.
@@ -1376,101 +1379,79 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         session_id: str = "",
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """
-        Wrapper around _stream_response that retries on garbled tool calls.
+        Stream Codex chunks through immediately.
 
-        When the Responses API model intermittently emits tool calls as garbled
-        text content (containing markers like +#+# or to=functions.), this
-        wrapper detects the pattern and retries the entire request.
-
-        Uses a buffer-then-flush approach: all chunks are collected first,
-        then checked for the garbled marker. Only if the stream is clean
-        are chunks yielded to the caller. This allows true retry since
-        no chunks have been sent to the HTTP client yet.
-
-        Detection is done both per-chunk (for early abort) AND on the
-        accumulated text after stream completion (to catch markers that
-        are split across multiple SSE chunks).
+        Historical behavior buffered the entire upstream response so garbled tool
+        calls could be retried after inspection. That made streaming look like a
+        non-streaming response. The default path now yields each clean chunk as it
+        arrives. Optional garbled-tool retry is limited to the pre-output window,
+        because retrying after bytes have reached the downstream client would
+        duplicate or reorder content.
         """
-        for attempt in range(GARBLED_TOOL_CALL_MAX_RETRIES):
-            garbled_detected = False
-            buffered_chunks: list = []
-            accumulated_text = ""  # Track all text content across chunks
+        retry_before_output = GARBLED_TOOL_CALL_RETRY_BEFORE_FIRST_OUTPUT
+        max_attempts = GARBLED_TOOL_CALL_MAX_RETRIES if retry_before_output else 1
+
+        for attempt in range(max_attempts):
+            emitted_output = False
+            garbled_before_output = False
 
             try:
                 async for chunk in self._stream_response(
                     client, headers, payload, model, reasoning_compat,
                     credential_path, session_id=session_id
                 ):
-                    # Extract content from this chunk for garble detection
-                    # NOTE: delta is a dict (not an object), so use dict access
-                    chunk_content = ""
-                    if hasattr(chunk, "choices") and chunk.choices:
-                        choice = chunk.choices[0]
-                        delta = getattr(choice, "delta", None)
-                        if delta:
-                            if isinstance(delta, dict):
-                                chunk_content = delta.get("content") or ""
-                            else:
-                                chunk_content = getattr(delta, "content", None) or ""
-
-                    # Accumulate text for cross-chunk detection
-                    if chunk_content:
-                        accumulated_text += chunk_content
-
-                    # Per-chunk check (catches garble within a single chunk)
+                    chunk_content = self._extract_chunk_content(chunk)
                     if chunk_content and _is_garbled_tool_call(chunk_content):
-                        garbled_detected = True
+                        if retry_before_output and not emitted_output:
+                            garbled_before_output = True
+                            lib_logger.warning(
+                                f"[Codex] Garbled tool call detected before first output for {model}, "
+                                f"attempt {attempt + 1}/{max_attempts}. "
+                                f"Content snippet: {chunk_content[:200]!r}"
+                            )
+                            break
+
                         lib_logger.warning(
-                            f"[Codex] Garbled tool call detected (per-chunk) in stream for {model}, "
-                            f"attempt {attempt + 1}/{GARBLED_TOOL_CALL_MAX_RETRIES}. "
-                            f"Content snippet: {chunk_content[:200]!r}"
+                            f"[Codex] Garbled tool-call marker appeared after streaming began for {model}; "
+                            "passing through because downstream output has already started."
                         )
-                        break  # Stop consuming this stream
 
-                    buffered_chunks.append(chunk)
+                    emitted_output = True
+                    yield chunk
 
-                # Post-stream check: inspect accumulated text for markers split across chunks
-                if not garbled_detected and _is_garbled_tool_call(accumulated_text):
-                    garbled_detected = True
-                    # Find the garbled portion for logging
-                    snippet_start = max(0, len(accumulated_text) - 200)
-                    lib_logger.warning(
-                        f"[Codex] Garbled tool call detected (accumulated) in stream for {model}, "
-                        f"attempt {attempt + 1}/{GARBLED_TOOL_CALL_MAX_RETRIES}. "
-                        f"Tail of accumulated text: {accumulated_text[snippet_start:]!r}"
-                    )
-
-                if not garbled_detected:
-                    # Stream was clean — flush all buffered chunks to caller
-                    for chunk in buffered_chunks:
-                        yield chunk
-                    return  # Done
+                if not garbled_before_output:
+                    return
 
             except Exception:
-                if garbled_detected:
-                    # Exception during stream teardown after garble detected - continue to retry
+                if garbled_before_output:
                     pass
                 else:
-                    raise  # Non-garble exception - propagate
+                    raise
 
-            # Garbled stream detected — discard buffer and retry if we have attempts left
-            if attempt < GARBLED_TOOL_CALL_MAX_RETRIES - 1:
+            if attempt < max_attempts - 1:
                 lib_logger.info(
-                    f"[Codex] Retrying request for {model} after garbled tool call "
-                    f"(attempt {attempt + 2}/{GARBLED_TOOL_CALL_MAX_RETRIES}). "
-                    f"Discarding {len(buffered_chunks)} buffered chunks, "
-                    f"{len(accumulated_text)} chars of accumulated text."
+                    f"[Codex] Retrying request for {model} after pre-output garbled tool call "
+                    f"(attempt {attempt + 2}/{max_attempts})."
                 )
                 await asyncio.sleep(GARBLED_TOOL_CALL_RETRY_DELAY)
             else:
                 lib_logger.error(
-                    f"[Codex] Garbled tool call persisted after {GARBLED_TOOL_CALL_MAX_RETRIES} "
-                    f"attempts for {model}. Flushing last attempt's buffer."
+                    f"[Codex] Pre-output garbled tool call persisted after {max_attempts} attempts for {model}."
                 )
-                # Flush the last attempt's buffer (garbled but better than nothing)
-                for chunk in buffered_chunks:
-                    yield chunk
                 return
+
+    @staticmethod
+    def _extract_chunk_content(chunk: Any) -> str:
+        """Extract streamed delta content from a LiteLLM-style chunk."""
+        if not hasattr(chunk, "choices") or not chunk.choices:
+            return ""
+        choice = chunk.choices[0]
+        delta = getattr(choice, "delta", None)
+        if not delta:
+            return ""
+        if isinstance(delta, dict):
+            return delta.get("content") or ""
+        return getattr(delta, "content", None) or ""
 
     async def _non_stream_with_retry(
         self,
