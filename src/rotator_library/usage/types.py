@@ -9,9 +9,8 @@ usage tracking, limits, and credential selection.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..core.constants import (
     DEFAULT_MAX_CONCURRENT_PER_KEY,
@@ -49,6 +48,7 @@ class LimitResult(str, Enum):
     BLOCKED_FAIR_CYCLE = "blocked_fair_cycle"
     BLOCKED_CUSTOM_CAP = "blocked_custom_cap"
     BLOCKED_CONCURRENT = "blocked_concurrent"
+    BLOCKED_CREDENTIAL_HEALTH = "blocked_credential_health"
 
 
 class RotationMode(str, Enum):
@@ -239,6 +239,48 @@ class CooldownInfo:
         return time.time() < self.until
 
 
+@dataclass
+class CredentialHealth:
+    """
+    Durable non-secret health state for a credential.
+
+    Health records intentionally store only status metadata. They do not store
+    tokens, provider response bodies, request headers, OAuth codes, or local
+    credential paths.
+    """
+
+    blocked: bool = False
+    status: str = "active"
+    reason: Optional[str] = None
+    source: str = "system"
+    blocked_at: Optional[float] = None
+    updated_at: Optional[float] = None
+    cleared_at: Optional[float] = None
+    failure_count: int = 0
+
+    @property
+    def is_blocking(self) -> bool:
+        """True when this health record should remove the credential from rotation."""
+        return self.blocked and self.status == "needs_reauth"
+
+
+@dataclass
+class CredentialStatusSnapshot:
+    """
+    Normalized non-secret credential status for humans and cleanup tooling.
+
+    This is a denormalized view derived from health, cooldowns, quota state, and
+    provider metadata. It deliberately stores status metadata only and never
+    stores raw tokens, request bodies, OAuth codes, or provider secrets.
+    """
+
+    status: str = "active"
+    reason: Optional[str] = None
+    source: str = "usage"
+    blocked_until: Optional[float] = None
+    updated_at: Optional[float] = None
+
+
 # =============================================================================
 # FAIR CYCLE TYPES
 # =============================================================================
@@ -332,6 +374,13 @@ class CredentialState:
 
     # Fair cycle state (keyed by model/group)
     fair_cycle: Dict[str, FairCycleState] = field(default_factory=dict)
+
+    # Normalized status snapshot for display, cleanup, and offline inspection.
+    status_snapshot: Optional[CredentialStatusSnapshot] = None
+
+    # Durable credential health gate is attached dynamically only when a
+    # credential has explicit health metadata. This keeps unblocked credentials
+    # indistinguishable from older state objects that never had the field.
 
     # Active requests (for concurrent request limiting)
     active_requests: int = 0

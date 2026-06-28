@@ -182,7 +182,7 @@ EXAMPLE: BUILDING AN ADMIN ENDPOINT
 =============================================================================
 """
 
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Dict, Optional, TYPE_CHECKING
 
 from ..types import CredentialState
 
@@ -343,6 +343,34 @@ class UsageAPI:
                 state=state,
                 model_or_group=model_or_group,
             )
+
+    async def mark_credential_needs_reauth(
+        self,
+        accessor: str,
+        reason: str = "manual_reauth_required",
+        source: str = "system",
+    ) -> bool:
+        """Persist a durable manual re-auth block for a credential."""
+        return await self._manager.mark_credential_needs_reauth(
+            accessor=accessor,
+            reason=reason,
+            source=source,
+        )
+
+    async def clear_credential_health_block(
+        self,
+        accessor: str,
+        reason: str = "manual_reauth_completed",
+    ) -> bool:
+        """Clear only the durable health block for a credential."""
+        return await self._manager.clear_credential_health_block(
+            accessor=accessor,
+            reason=reason,
+        )
+
+    def is_credential_health_blocked(self, accessor: str) -> bool:
+        """Return True if a credential is blocked by durable health state."""
+        return self._manager.is_credential_health_blocked(accessor)
 
     async def mark_exhausted(
         self,

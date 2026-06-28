@@ -98,6 +98,19 @@ class CredentialFilter:
         tier_names: Dict[str, str] = {}
 
         for cred in credentials:
+            if plugin and hasattr(plugin, "is_credential_available"):
+                try:
+                    if not plugin.is_credential_available(cred):
+                        incompatible.append(cred)
+                        continue
+                except Exception as exc:
+                    lib_logger.debug(
+                        "Credential availability check failed for %s/%s: %s",
+                        provider,
+                        cred,
+                        exc,
+                    )
+
             # Get priority and tier name
             priority = None
             tier_name = None

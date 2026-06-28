@@ -588,6 +588,7 @@ def _save_credential_file(flow: dict, creds: dict):
 
     next_num = (max(numbers) + 1) if numbers else 1
     filepath = oauth_dir / f"{prefix}_oauth_{next_num}.json"
+    creds.setdefault("_proxy_metadata", {})["status"] = "active"
 
     with open(filepath, "w") as f:
         json.dump(creds, f, indent=2)

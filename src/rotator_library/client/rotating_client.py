@@ -823,6 +823,21 @@ class RotatingClient:
         """
         return self._usage_registry.get_usage_manager(provider)
 
+    async def clear_credential_health_block(self, provider: str, filename: str) -> bool:
+        """Clear durable health for one OAuth credential by provider/filename."""
+        provider_lower = provider.lower()
+        manager = self.get_usage_manager(provider_lower)
+        if not manager:
+            return False
+
+        for credential in self.all_credentials.get(provider_lower, []):
+            if str(credential).endswith(filename) or str(credential) == filename:
+                return await manager.clear_credential_health_block(
+                    str(credential),
+                    reason="manual_reauth_completed",
+                )
+        return False
+
     @property
     def usage_managers(self) -> Dict[str, NewUsageManager]:
         """Get all new usage managers."""

@@ -54,6 +54,18 @@ def _seconds_to_minutes(seconds: Optional[int]) -> Optional[int]:
     return seconds // 60
 
 
+def _codex_terminal_auth_reason(status_code: int, body: str) -> Optional[str]:
+    """Return allowlisted terminal auth reason for Codex quota responses."""
+    if status_code not in (401, 403):
+        return None
+    lowered = body.lower()
+    if "token_revoked" in lowered:
+        return "token_revoked"
+    if "token_invalidated" in lowered or "invalidated oauth token" in lowered:
+        return "token_invalidated"
+    return "refresh_unauthorized" if status_code == 401 else "refresh_forbidden"
+
+
 def _window_label_from_seconds(seconds: Optional[int]) -> str:
     """Derive a quota group label from window duration in seconds.
 
@@ -334,6 +346,46 @@ class CodexQuotaTracker:
         """Set the UsageManager reference for pushing quota updates."""
         self._usage_manager = usage_manager
 
+    def _is_health_blocked(self, credential_path: str) -> bool:
+        """Return True if provider/usage health says this credential is blocked."""
+        if hasattr(self, "is_credential_available"):
+            try:
+                if not self.is_credential_available(credential_path):
+                    return True
+            except Exception:
+                pass
+
+        if self._usage_manager and hasattr(self._usage_manager, "is_credential_health_blocked"):
+            try:
+                return bool(self._usage_manager.is_credential_health_blocked(credential_path))
+            except Exception:
+                return False
+
+        return False
+
+    async def _mark_quota_auth_needs_reauth(
+        self,
+        credential_path: str,
+        reason: str,
+    ) -> None:
+        """Persist a quota-refresh terminal auth block without raw response data."""
+        if not self._usage_manager or not hasattr(
+            self._usage_manager, "mark_credential_needs_reauth"
+        ):
+            return
+        try:
+            await self._usage_manager.mark_credential_needs_reauth(
+                credential_path,
+                reason=reason,
+                source="codex_quota_refresh",
+            )
+        except Exception as exc:
+            lib_logger.debug(
+                "Failed to mark Codex quota auth health for %s: %s",
+                _get_credential_identifier(credential_path),
+                exc,
+            )
+
     # =========================================================================
     # QUOTA API FETCHING
     # =========================================================================
@@ -354,6 +406,19 @@ class CodexQuotaTracker:
             CodexQuotaSnapshot with rate limit and credits info
         """
         identifier = _get_credential_identifier(credential_path)
+
+        if self._is_health_blocked(credential_path):
+            return CodexQuotaSnapshot(
+                credential_path=credential_path,
+                identifier=identifier,
+                plan_type=None,
+                primary=None,
+                secondary=None,
+                credits=None,
+                fetched_at=time.time(),
+                status="blocked",
+                error="credential_needs_reauth",
+            )
 
         try:
             # Get auth headers
@@ -445,7 +510,13 @@ class CodexQuotaTracker:
             return snapshot
 
         except httpx.HTTPStatusError as e:
-            error_msg = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
+            reason = _codex_terminal_auth_reason(
+                e.response.status_code,
+                e.response.text,
+            )
+            if reason:
+                await self._mark_quota_auth_needs_reauth(credential_path, reason)
+            error_msg = f"HTTP {e.response.status_code}"
             lib_logger.warning(f"Failed to fetch Codex quota for {identifier}: {error_msg}")
             return CodexQuotaSnapshot(
                 credential_path=credential_path,
@@ -773,6 +844,11 @@ class CodexQuotaTracker:
         if not credentials:
             return
 
+        credentials = [cred for cred in credentials if not self._is_health_blocked(cred)]
+        if not credentials:
+            lib_logger.debug("No Codex credentials available for quota refresh")
+            return
+
         # On first run, fetch baselines for ALL credentials to detect exhaustion
         if not self._initial_baselines_fetched:
             try:
@@ -1044,6 +1120,12 @@ class CodexQuotaTracker:
             async with semaphore:
                 snapshot = await self.fetch_quota_from_api(cred_path, api_base)
                 return cred_path, snapshot
+
+        credential_paths = [
+            cred for cred in credential_paths if not self._is_health_blocked(cred)
+        ]
+        if not credential_paths:
+            return {}
 
         tasks = [fetch_with_semaphore(cred) for cred in credential_paths]
         fetch_results = await asyncio.gather(*tasks, return_exceptions=True)

@@ -8,6 +8,7 @@ This is the main public API for the usage tracking system.
 """
 
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -15,11 +16,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Union
 
 from ..core.types import RequestCompleteResult
-from ..error_handler import ClassifiedError, classify_error, mask_credential
+from ..error_handler import (
+    ClassifiedError,
+    CredentialNeedsReauthError,
+    classify_error,
+    mask_credential,
+)
 
 from .types import (
     WindowStats,
     CredentialState,
+    CredentialHealth,
+    CredentialStatusSnapshot,
     LimitResult,
     RotationMode,
     FAIR_CYCLE_GLOBAL_KEY,
@@ -296,6 +304,11 @@ class UsageManager:
                     self._states[stable_id].priority = priorities[accessor]
                 if tiers and accessor in tiers:
                     self._states[stable_id].tier = tiers[accessor]
+
+                # Trust only local credential metadata status values. This keeps
+                # imported needs_reauth files blocked even before a producer has
+                # refreshed usage storage, without persisting secrets or paths.
+                self._sync_health_from_credential_file(self._states[stable_id])
 
                 # Always set max concurrent. Values <= 0 mean unlimited and
                 # bypass multiplier logic entirely.
@@ -798,6 +811,12 @@ class UsageManager:
         if not success and error and hook_result is None:
             if error.error_type in {"server_error", "api_connection"}:
                 request_count = 0
+            elif self._should_mark_failure_needs_reauth(error):
+                await self.mark_credential_needs_reauth(
+                    state.accessor,
+                    reason=self._health_reason_from_error(error),
+                    source="request_failure",
+                )
 
         if request_count == 0:
             prompt_tokens = 0
@@ -880,6 +899,77 @@ class UsageManager:
                 model_or_group=model_or_group,
             )
             await self._save_if_needed()
+
+    async def mark_credential_needs_reauth(
+        self,
+        accessor: str,
+        reason: str = "manual_reauth_required",
+        source: str = "system",
+    ) -> bool:
+        """Persist a durable non-secret manual re-auth health block."""
+        stable_id = self._registry.get_stable_id(accessor, self.provider)
+        state = self._states.get(stable_id)
+        if not state:
+            state = CredentialState(
+                stable_id=stable_id,
+                provider=self.provider,
+                accessor=accessor,
+                created_at=time.time(),
+            )
+            self._states[stable_id] = state
+
+        now = time.time()
+        existing_health = getattr(state, "credential_health", None)
+        previous_count = existing_health.failure_count if existing_health else 0
+        state.credential_health = CredentialHealth(
+            blocked=True,
+            status="needs_reauth",
+            reason=self._sanitize_health_reason(reason),
+            source=self._sanitize_health_source(source),
+            blocked_at=existing_health.blocked_at
+            if existing_health and existing_health.blocked_at
+            else now,
+            updated_at=now,
+            failure_count=previous_count + 1,
+        )
+        state.last_updated = now
+        self._active_stable_ids.add(stable_id)
+        await self.save(force=True)
+        lib_logger.info(
+            "Marked credential %s as needs_reauth (reason=%s, source=%s)",
+            mask_credential(state.accessor, style="full"),
+            state.credential_health.reason,
+            state.credential_health.source,
+        )
+        return True
+
+    async def clear_credential_health_block(
+        self,
+        accessor: str,
+        reason: str = "manual_reauth_completed",
+    ) -> bool:
+        """Clear only the credential health block, preserving usage/cooldowns."""
+        stable_id = self._registry.get_stable_id(accessor, self.provider)
+        state = self._states.get(stable_id)
+        if not state or not getattr(state, "credential_health", None):
+            return False
+
+        delattr(state, "credential_health")
+        state.last_updated = time.time()
+        await self.save(force=True)
+        lib_logger.info(
+            "Cleared credential health block for %s (reason=%s)",
+            mask_credential(state.accessor, style="full"),
+            self._sanitize_health_reason(reason),
+        )
+        return True
+
+    def is_credential_health_blocked(self, accessor: str) -> bool:
+        """Return True when a credential has a durable manual re-auth block."""
+        stable_id = self._registry.get_stable_id(accessor, self.provider)
+        state = self._states.get(stable_id)
+        health = getattr(state, "credential_health", None) if state else None
+        return bool(health and health.is_blocking)
 
     async def get_availability_stats(
         self,
@@ -1145,6 +1235,20 @@ class UsageManager:
             if cp_cost:
                 cp_block["approx_cost"] = (cp_block["approx_cost"] or 0.0) + cp_cost
 
+            health = getattr(state, "credential_health", None)
+            if health and health.is_blocking:
+                status = "needs_reauth"
+                cred_stats["status"] = status
+                cred_stats["credential_health"] = {
+                    "blocked": health.blocked,
+                    "status": health.status,
+                    "reason": health.reason,
+                    "source": health.source,
+                    "blocked_at": health.blocked_at,
+                    "updated_at": health.updated_at,
+                    "failure_count": health.failure_count,
+                }
+
             if status == "active":
                 stats["active_count"] += 1
             elif status == "exhausted":
@@ -1333,7 +1437,7 @@ class UsageManager:
                 # capacity to global totals — their quota windows may show
                 # headroom (e.g. 5hr/weekly) that is unreachable because a
                 # higher-tier window (e.g. monthly) is fully consumed.
-                cred_is_blocked = status in ("exhausted", "cooldown")
+                cred_is_blocked = status in ("exhausted", "cooldown", "needs_reauth")
 
                 for window_name, window in group_windows.items():
                     window_agg = group_agg[
@@ -1581,6 +1685,7 @@ class UsageManager:
             True if saved successfully
         """
         if self._storage:
+            self._refresh_status_snapshots()
             fair_cycle_global = self._limits.fair_cycle_checker.get_global_state_dict()
             return await self._storage.save(
                 self._states, fair_cycle_global, force=force
@@ -1634,6 +1739,10 @@ class UsageManager:
                     current.totals = loaded_state.totals
                     current.cooldowns = loaded_state.cooldowns
                     current.fair_cycle = loaded_state.fair_cycle
+                    if hasattr(loaded_state, "credential_health"):
+                        current.credential_health = loaded_state.credential_health
+                    elif hasattr(current, "credential_health"):
+                        delattr(current, "credential_health")
                     current.last_updated = loaded_state.last_updated
                 else:
                     # New credential from disk, add it
@@ -2202,6 +2311,212 @@ class UsageManager:
     # PRIVATE METHODS
     # =========================================================================
 
+    @staticmethod
+    def _sanitize_health_reason(reason: Optional[str]) -> str:
+        """Return an allowlisted durable health reason code."""
+        allowed = {
+            "invalid_grant",
+            "refresh_unauthorized",
+            "refresh_forbidden",
+            "token_revoked",
+            "token_invalidated",
+            "missing_refresh_token",
+            "manual_reauth_required",
+            "manual_reauth_completed",
+            "reauth_success",
+            "request_authentication",
+            "request_reauth_needed",
+        }
+        normalized = (reason or "manual_reauth_required").strip().lower()
+        return normalized if normalized in allowed else "manual_reauth_required"
+
+    @staticmethod
+    def _sanitize_health_source(source: Optional[str]) -> str:
+        """Return an allowlisted durable health source code."""
+        allowed = {
+            "oauth_refresh",
+            "oauth_initialize",
+            "codex_quota_refresh",
+            "request_failure",
+            "admin_clear",
+            "oauth_save",
+            "system",
+        }
+        normalized = (source or "system").strip().lower()
+        return normalized if normalized in allowed else "system"
+
+    @staticmethod
+    def _terminal_auth_reason_from_body(body: str) -> Optional[str]:
+        """Classify precise terminal auth markers without storing the body."""
+        lowered = body.lower()
+        if "invalid_grant" in lowered:
+            return "invalid_grant"
+        if "token_revoked" in lowered:
+            return "token_revoked"
+        if "token_invalidated" in lowered or "invalidated oauth token" in lowered:
+            return "token_invalidated"
+        return None
+
+    def _health_reason_from_error(self, error: ClassifiedError) -> str:
+        """Map a classified request failure to a durable health reason code."""
+        if error.error_type == "credential_reauth_needed":
+            return "request_reauth_needed"
+        original = error.original_exception
+        if isinstance(original, CredentialNeedsReauthError):
+            return "request_reauth_needed"
+        if isinstance(original, Exception) and hasattr(original, "response"):
+            response = getattr(original, "response", None)
+            body = getattr(response, "text", "") if response is not None else ""
+            reason = self._terminal_auth_reason_from_body(str(body))
+            if reason:
+                return reason
+        if error.error_type == "authentication":
+            return "request_authentication"
+        return "manual_reauth_required"
+
+    def _should_mark_failure_needs_reauth(self, error: ClassifiedError) -> bool:
+        """Only mark precise terminal auth failures, never transient/quota failures."""
+        if error.error_type == "credential_reauth_needed":
+            return True
+        if error.error_type != "authentication":
+            return False
+        original = error.original_exception
+        response = getattr(original, "response", None)
+        body = getattr(response, "text", "") if response is not None else ""
+        if self._terminal_auth_reason_from_body(str(body)):
+            return True
+        return self.provider in {"codex", "openai"} and error.status_code == 401
+
+    def _sync_health_from_credential_file(self, state: CredentialState) -> None:
+        """Import local credential metadata status without storing file contents."""
+        accessor = str(state.accessor)
+        if not accessor.endswith(".json"):
+            return
+        path = Path(accessor)
+        if not path.exists():
+            return
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        metadata = data.get("_proxy_metadata", {})
+        status = str(metadata.get("status") or "").lower()
+        if status == "needs_reauth":
+            now = time.time()
+            state.credential_health = CredentialHealth(
+                blocked=True,
+                status="needs_reauth",
+                reason="manual_reauth_required",
+                source="oauth_initialize",
+                blocked_at=now,
+                updated_at=now,
+            )
+        health = getattr(state, "credential_health", None)
+        if status == "active" and health and health.is_blocking:
+            delattr(state, "credential_health")
+
+    def _status_snapshot_for_state(
+        self,
+        state: CredentialState,
+        *,
+        hidden_groups: frozenset[str] = frozenset(),
+        defined_groups: frozenset[str] = frozenset(),
+        now: Optional[float] = None,
+    ) -> CredentialStatusSnapshot:
+        """Build normalized credential status metadata for storage and display."""
+        current_time = time.time() if now is None else now
+        health = getattr(state, "credential_health", None)
+        if health and health.is_blocking:
+            return CredentialStatusSnapshot(
+                status="needs_reauth",
+                reason=health.reason,
+                source=f"credential_health.{health.source}",
+                blocked_until=None,
+                updated_at=current_time,
+            )
+
+        active_cooldowns = {
+            str(key): cooldown
+            for key, cooldown in state.cooldowns.items()
+            if cooldown.until > current_time
+        }
+        if not active_cooldowns:
+            return CredentialStatusSnapshot(
+                status="active",
+                reason=None,
+                source="usage",
+                blocked_until=None,
+                updated_at=current_time,
+            )
+
+        if "_global_" in active_cooldowns:
+            cooldown = active_cooldowns["_global_"]
+            return CredentialStatusSnapshot(
+                status="cooldown",
+                reason=cooldown.reason,
+                source="usage.cooldowns._global_",
+                blocked_until=cooldown.until,
+                updated_at=current_time,
+            )
+
+        cooldown_groups = set(active_cooldowns)
+        hidden_cooldowns = cooldown_groups & hidden_groups
+        if hidden_cooldowns:
+            key = min(hidden_cooldowns, key=lambda item: active_cooldowns[item].until)
+            cooldown = active_cooldowns[key]
+            return CredentialStatusSnapshot(
+                status="exhausted",
+                reason=cooldown.reason,
+                source=f"usage.cooldowns.{key}",
+                blocked_until=cooldown.until,
+                updated_at=current_time,
+            )
+
+        all_group_keys = set(state.group_usage.keys()) if state.group_usage else set()
+        known_groups = all_group_keys & defined_groups if defined_groups else all_group_keys
+        visible_known_groups = known_groups - hidden_groups if hidden_groups else known_groups
+        status = (
+            "exhausted"
+            if visible_known_groups and cooldown_groups >= visible_known_groups
+            else "mixed"
+        )
+        key = min(cooldown_groups, key=lambda item: active_cooldowns[item].until)
+        cooldown = active_cooldowns[key]
+        return CredentialStatusSnapshot(
+            status=status,
+            reason=cooldown.reason,
+            source=f"usage.cooldowns.{key}",
+            blocked_until=cooldown.until,
+            updated_at=current_time,
+        )
+
+    def _refresh_status_snapshots(self) -> None:
+        """Refresh normalized status snapshots before persistence."""
+        hidden_groups: frozenset[str] = frozenset()
+        defined_groups: frozenset[str] = frozenset()
+        plugin_class = self._provider_plugins.get(self.provider)
+        if plugin_class:
+            plugin_instance = self._get_provider_plugin_instance()
+            source = plugin_instance or plugin_class
+            hidden_groups = frozenset(getattr(source, "hidden_quota_groups", ()) or ())
+            model_quota_groups = getattr(source, "model_quota_groups", {}) or {}
+            defined_groups = (
+                frozenset(str(group) for group in model_quota_groups.keys())
+                if isinstance(model_quota_groups, dict)
+                else frozenset(str(group) for group in model_quota_groups)
+            )
+
+        now = time.time()
+        for state in self._states.values():
+            state.status_snapshot = self._status_snapshot_for_state(
+                state,
+                hidden_groups=hidden_groups,
+                defined_groups=defined_groups,
+                now=now,
+            )
+
     def _get_active_states(self) -> Dict[str, CredentialState]:
         """
         Get only active credential states.
@@ -2301,6 +2616,7 @@ class UsageManager:
         """Persist state if storage is configured."""
         if not self._storage:
             return
+        self._refresh_status_snapshots()
         fair_cycle_global = self._limits.fair_cycle_checker.get_global_state_dict()
         saved = await self._storage.save(self._states, fair_cycle_global)
         if not saved:
@@ -2316,6 +2632,7 @@ class UsageManager:
             await asyncio.sleep(self._storage.save_debounce_seconds)
             if not self._storage:
                 return
+            self._refresh_status_snapshots()
             fair_cycle_global = self._limits.fair_cycle_checker.get_global_state_dict()
             await self._storage.save_if_dirty(self._states, fair_cycle_global)
 
@@ -2406,6 +2723,13 @@ class UsageManager:
             quota_reset = error.quota_reset_timestamp
 
             # Mark exhausted for quota errors with long cooldown
+            if self._should_mark_failure_needs_reauth(error):
+                await self.mark_credential_needs_reauth(
+                    state.accessor,
+                    reason=self._health_reason_from_error(error),
+                    source="request_failure",
+                )
+
             if error.error_type == "quota_exceeded":
                 if (
                     cooldown_duration

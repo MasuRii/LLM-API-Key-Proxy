@@ -10,13 +10,12 @@ and rotation strategies to select the best credential.
 
 import time
 import logging
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set
 
 from ..types import (
     CredentialState,
     SelectionContext,
     RotationMode,
-    LimitCheckResult,
 )
 from ..config import ProviderUsageConfig
 from ..limits.engine import LimitEngine
@@ -257,6 +256,7 @@ class SelectionEngine:
         total = len(states)
         available = 0
         blocked_by = {
+            "credential_health": 0,
             "cooldowns": 0,
             "window_limits": 0,
             "custom_caps": 0,

@@ -13,7 +13,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 from ..types import (
     WindowStats,
@@ -22,9 +22,9 @@ from ..types import (
     GroupStats,
     CredentialState,
     CooldownInfo,
+    CredentialHealth,
+    CredentialStatusSnapshot,
     FairCycleState,
-    GlobalFairCycleState,
-    StorageSchema,
 )
 from ...utils.resilient_io import ResilientStateWriter, safe_read_json
 from ...error_handler import mask_credential
@@ -59,7 +59,7 @@ class UsageStorage:
     - Debounced saves to reduce I/O
     """
 
-    CURRENT_SCHEMA_VERSION = 2
+    CURRENT_SCHEMA_VERSION = 3
 
     def __init__(
         self,
@@ -108,6 +108,9 @@ class UsageStorage:
                     f"Migrating usage data from v{version} to v{self.CURRENT_SCHEMA_VERSION}"
                 )
                 data = self._migrate(data, version)
+            else:
+                data.setdefault("accessor_index", {})
+                data.setdefault("fair_cycle_global", {})
 
             # Parse credentials
             states = {}
@@ -241,6 +244,15 @@ class UsageStorage:
                 new_credentials[stable_id]["accessor"] = key
 
             data["credentials"] = new_credentials
+            from_version = 2
+
+        if from_version == 2:
+            # v2 -> v3: credential_health is optional and only present for
+            # blocked/previously blocked credentials, so no per-record rewrite is
+            # necessary.
+            data["schema_version"] = 3
+            data.setdefault("accessor_index", {})
+            data.setdefault("fair_cycle_global", {})
 
         return data
 
@@ -370,6 +382,126 @@ class UsageStorage:
 
         return GroupStats(windows=windows, totals=totals)
 
+    def _parse_credential_health(
+        self, data: Optional[Dict[str, Any]]
+    ) -> Optional[CredentialHealth]:
+        """Parse non-secret credential health metadata from storage."""
+        if not isinstance(data, dict):
+            return None
+
+        return CredentialHealth(
+            blocked=bool(data.get("blocked", False)),
+            status=str(data.get("status") or "active"),
+            reason=data.get("reason"),
+            source=str(data.get("source") or "system"),
+            blocked_at=data.get("blocked_at"),
+            updated_at=data.get("updated_at"),
+            cleared_at=data.get("cleared_at"),
+            failure_count=int(data.get("failure_count") or 0),
+        )
+
+    def _serialize_credential_health(
+        self, health: Optional[CredentialHealth]
+    ) -> Optional[Dict[str, Any]]:
+        """Serialize non-secret credential health metadata for storage."""
+        if health is None:
+            return None
+
+        payload = {
+            "blocked": health.blocked,
+            "status": health.status,
+            "reason": health.reason,
+            "source": health.source,
+            "blocked_at": health.blocked_at,
+            "blocked_at_human": _format_timestamp(health.blocked_at),
+            "updated_at": health.updated_at,
+            "updated_at_human": _format_timestamp(health.updated_at),
+            "cleared_at": health.cleared_at,
+            "cleared_at_human": _format_timestamp(health.cleared_at),
+            "failure_count": health.failure_count,
+        }
+        return {key: value for key, value in payload.items() if value is not None}
+
+    def _parse_status_snapshot(
+        self,
+        data: Optional[Dict[str, Any]],
+    ) -> Optional[CredentialStatusSnapshot]:
+        """Parse normalized credential status metadata from storage."""
+        if not isinstance(data, dict):
+            return None
+
+        return CredentialStatusSnapshot(
+            status=str(data.get("status") or "active"),
+            reason=data.get("reason"),
+            source=str(data.get("source") or "usage"),
+            blocked_until=data.get("blocked_until"),
+            updated_at=data.get("updated_at"),
+        )
+
+    def _derive_status_snapshot(self, state: CredentialState) -> CredentialStatusSnapshot:
+        """Build a provider-agnostic fallback status snapshot for storage."""
+        now = time.time()
+        health = getattr(state, "credential_health", None)
+        if health and health.is_blocking:
+            return CredentialStatusSnapshot(
+                status="needs_reauth",
+                reason=health.reason,
+                source=f"credential_health.{health.source}",
+                blocked_until=None,
+                updated_at=now,
+            )
+
+        active_cooldowns = {
+            key: cooldown
+            for key, cooldown in state.cooldowns.items()
+            if cooldown.until > now
+        }
+        if active_cooldowns:
+            key, cooldown = min(
+                active_cooldowns.items(),
+                key=lambda item: (item[1].until, item[0]),
+            )
+            status = "cooldown"
+            if key != "_global_" and (
+                key.endswith("-global") or cooldown.reason == "quota_exhausted"
+            ):
+                status = "exhausted"
+            return CredentialStatusSnapshot(
+                status=status,
+                reason=cooldown.reason,
+                source=f"usage.cooldowns.{key}",
+                blocked_until=cooldown.until,
+                updated_at=now,
+            )
+
+        return CredentialStatusSnapshot(
+            status="active",
+            reason=None,
+            source="usage",
+            blocked_until=None,
+            updated_at=now,
+        )
+
+    def _serialize_status_snapshot(
+        self,
+        snapshot: Optional[CredentialStatusSnapshot],
+        state: CredentialState,
+    ) -> Dict[str, Any]:
+        """Serialize normalized credential status metadata for storage."""
+        effective = snapshot or self._derive_status_snapshot(state)
+        if effective.updated_at is None:
+            effective.updated_at = time.time()
+        payload = {
+            "status": effective.status,
+            "reason": effective.reason,
+            "source": effective.source,
+            "blocked_until": effective.blocked_until,
+            "blocked_until_human": _format_timestamp(effective.blocked_until),
+            "updated_at": effective.updated_at,
+            "updated_at_human": _format_timestamp(effective.updated_at),
+        }
+        return {key: value for key, value in payload.items() if value is not None}
+
     def _serialize_group_stats(self, stats: GroupStats) -> Dict[str, Any]:
         """Serialize group stats for storage."""
         return {
@@ -423,6 +555,11 @@ class UsageStorage:
                     model_or_group=key,
                 )
 
+            credential_health = self._parse_credential_health(
+                data.get("credential_health") or data.get("health_block")
+            )
+            status_snapshot = self._parse_status_snapshot(data.get("status_snapshot"))
+
             raw_max_concurrent = data.get(
                 "max_concurrent", DEFAULT_MAX_CONCURRENT_PER_KEY
             )
@@ -443,7 +580,7 @@ class UsageStorage:
             if optimal_concurrent <= 0:
                 optimal_concurrent = -1
 
-            return CredentialState(
+            state = CredentialState(
                 stable_id=stable_id,
                 provider=data.get("provider", "unknown"),
                 accessor=data.get("accessor", stable_id),
@@ -455,12 +592,16 @@ class UsageStorage:
                 totals=totals,
                 cooldowns=cooldowns,
                 fair_cycle=fair_cycle,
+                status_snapshot=status_snapshot,
                 active_requests=0,  # Always starts at 0
                 optimal_concurrent=optimal_concurrent,
                 max_concurrent=max_concurrent,
                 created_at=data.get("created_at"),
                 last_updated=data.get("last_updated"),
             )
+            if credential_health is not None:
+                state.credential_health = credential_health
+            return state
 
         except Exception as e:
             lib_logger.warning(
@@ -497,7 +638,7 @@ class UsageStorage:
                 "cycle_request_count": fc.cycle_request_count,
             }
 
-        return {
+        payload = {
             "provider": state.provider,
             "accessor": state.accessor,
             "private": str(state.accessor).startswith("private:"),
@@ -515,6 +656,10 @@ class UsageStorage:
             "totals": self._serialize_total_stats(state.totals),
             "cooldowns": cooldowns,
             "fair_cycle": fair_cycle,
+            "status_snapshot": self._serialize_status_snapshot(
+                state.status_snapshot,
+                state,
+            ),
             "optimal_concurrent": state.optimal_concurrent,
             "max_concurrent": state.max_concurrent,
             "created_at": state.created_at,
@@ -522,3 +667,11 @@ class UsageStorage:
             "last_updated": state.last_updated,
             "last_updated_human": _format_timestamp(state.last_updated),
         }
+
+        credential_health = self._serialize_credential_health(
+            getattr(state, "credential_health", None)
+        )
+        if credential_health is not None:
+            payload["credential_health"] = credential_health
+
+        return payload

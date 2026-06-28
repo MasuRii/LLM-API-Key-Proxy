@@ -42,7 +42,7 @@ from ..utils.reauth_coordinator import (
     is_auto_oauth_reauth_enabled,
 )
 from ..utils.resilient_io import safe_write_json
-from ..error_handler import CredentialNeedsReauthError
+from ..error_handler import CredentialNeedsReauthError, mask_credential
 from ..proxy_config import ProxyConfig
 from .utilities.codex_credential_formats import normalize_codex_credential_payload
 
@@ -200,6 +200,14 @@ class OpenAIOAuthBase:
 
         # Proxy configuration (injected by RotatingClient after construction)
         self._proxy_config: Optional[ProxyConfig] = None
+
+        # Optional UsageManager reference injected by RotatingClient or tests for
+        # durable manual re-auth health blocks.
+        self._usage_manager: Optional[Any] = None
+
+    def set_usage_manager(self, usage_manager: Any) -> None:
+        """Set UsageManager for durable credential health integration."""
+        self._usage_manager = usage_manager
 
     def _parse_env_credential_path(self, path: str) -> Optional[str]:
         """Parse a virtual env:// path and return the credential index."""
@@ -376,6 +384,115 @@ class OpenAIOAuthBase:
                 return stable
         return ""
 
+    @staticmethod
+    def _health_reason_from_refresh_error(status_code: int, error_body: str) -> str:
+        """Map terminal token-refresh failures to allowlisted health reasons."""
+        lowered = error_body.lower()
+        if status_code == 400 and "invalid_grant" in lowered:
+            return "invalid_grant"
+        if status_code == 401:
+            return "refresh_unauthorized"
+        if status_code == 403:
+            return "refresh_forbidden"
+        return "manual_reauth_required"
+
+    async def _mark_credential_needs_reauth(
+        self,
+        path: str,
+        reason: str,
+        source: str = "oauth_refresh",
+    ) -> None:
+        """Persist durable health metadata without storing provider response bodies."""
+        self._unavailable_credentials[path] = time.time()
+
+        manager = getattr(self, "_usage_manager", None)
+        if manager and hasattr(manager, "mark_credential_needs_reauth"):
+            try:
+                await manager.mark_credential_needs_reauth(
+                    path,
+                    reason=reason,
+                    source=source,
+                )
+                return
+            except Exception as exc:
+                lib_logger.debug(
+                    "Failed to persist credential health for %s: %s",
+                    mask_credential(path, style="full"),
+                    exc,
+                )
+
+        storage = getattr(self, "_health_storage", None)
+        states = getattr(self, "_health_states", None)
+        if storage and isinstance(states, dict):
+            from ..usage.types import CredentialHealth
+
+            now = time.time()
+            for state in states.values():
+                if state.accessor == path:
+                    existing_health = getattr(state, "credential_health", None)
+                    previous_count = existing_health.failure_count if existing_health else 0
+                    state.credential_health = CredentialHealth(
+                        blocked=True,
+                        status="needs_reauth",
+                        reason=reason,
+                        source=source,
+                        blocked_at=existing_health.blocked_at
+                        if existing_health and existing_health.blocked_at
+                        else now,
+                        updated_at=now,
+                        failure_count=previous_count + 1,
+                    )
+                    state.last_updated = now
+                    await storage.save(states, force=True)
+                    return
+
+    def _has_durable_health_block(self, path: str) -> bool:
+        """Return True if UsageManager/test storage marks credential needs_reauth."""
+        manager = getattr(self, "_usage_manager", None)
+        if manager and hasattr(manager, "is_credential_health_blocked"):
+            try:
+                if manager.is_credential_health_blocked(path):
+                    return True
+            except Exception:
+                pass
+
+        states = getattr(self, "_health_states", None)
+        if isinstance(states, dict):
+            for state in states.values():
+                if state.accessor == path:
+                    health = getattr(state, "credential_health", None)
+                    if health and health.is_blocking:
+                        return True
+
+        return False
+
+    async def _clear_credential_health_block(
+        self,
+        path: str,
+        reason: str = "reauth_success",
+    ) -> None:
+        """Clear only durable health state after a successful refresh or save."""
+        manager = getattr(self, "_usage_manager", None)
+        if manager and hasattr(manager, "clear_credential_health_block"):
+            try:
+                await manager.clear_credential_health_block(path, reason=reason)
+            except Exception as exc:
+                lib_logger.debug(
+                    "Failed to clear credential health for %s: %s",
+                    mask_credential(path, style="full"),
+                    exc,
+                )
+
+        states = getattr(self, "_health_states", None)
+        storage = getattr(self, "_health_storage", None)
+        if storage and isinstance(states, dict):
+            for state in states.values():
+                if state.accessor == path and getattr(state, "credential_health", None):
+                    delattr(state, "credential_health")
+                    state.last_updated = time.time()
+                    await storage.save(states, force=True)
+                    break
+
     def _build_proxy_client_kwargs(self, path: str, provider: str = "") -> Dict[str, Any]:
         """Build httpx.AsyncClient kwargs with proxy routing for a credential.
 
@@ -412,6 +529,11 @@ class OpenAIOAuthBase:
 
             refresh_token = creds.get("refresh_token")
             if not refresh_token:
+                await self._mark_credential_needs_reauth(
+                    path,
+                    reason="missing_refresh_token",
+                    source="oauth_refresh",
+                )
                 raise ValueError("No refresh_token found in credentials file.")
 
             max_retries = 3
@@ -451,7 +573,13 @@ class OpenAIOAuthBase:
                                 )
                                 msg = f"Refresh token invalid for '{Path(path).name}'. Re-auth queued."
                             else:
-                                self._unavailable_credentials[path] = time.time()
+                                await self._mark_credential_needs_reauth(
+                                    path,
+                                    reason=self._health_reason_from_refresh_error(
+                                        status_code, error_body
+                                    ),
+                                    source="oauth_refresh",
+                                )
                                 msg = (
                                     f"Refresh token invalid for '{Path(path).name}'. "
                                     "Automatic OAuth re-auth is disabled. Run the credential tool "
@@ -474,7 +602,13 @@ class OpenAIOAuthBase:
                                 )
                                 msg = f"Token invalid for '{Path(path).name}' (HTTP {status_code}). Re-auth queued."
                             else:
-                                self._unavailable_credentials[path] = time.time()
+                                await self._mark_credential_needs_reauth(
+                                    path,
+                                    reason=self._health_reason_from_refresh_error(
+                                        status_code, error_body
+                                    ),
+                                    source="oauth_refresh",
+                                )
                                 msg = (
                                     f"Token invalid for '{Path(path).name}' (HTTP {status_code}). "
                                     "Automatic OAuth re-auth is disabled. Run the credential tool "
@@ -530,6 +664,8 @@ class OpenAIOAuthBase:
             creds["_proxy_metadata"]["last_check_timestamp"] = time.time()
 
             await self._save_credentials(path, creds)
+            await self._clear_credential_health_block(path, reason="reauth_success")
+            self._unavailable_credentials.pop(path, None)
             lib_logger.debug(
                 f"Successfully refreshed {self.ENV_PREFIX} OAuth token for '{Path(path).name}'."
             )
@@ -544,6 +680,9 @@ class OpenAIOAuthBase:
 
     def is_credential_available(self, path: str) -> bool:
         """Check if a credential is available for rotation."""
+        if self._has_durable_health_block(path):
+            return False
+
         if path in self._unavailable_credentials:
             marked_time = self._unavailable_credentials.get(path)
             if marked_time is not None:
@@ -743,6 +882,7 @@ class OpenAIOAuthBase:
                 try:
                     lib_logger.info(f"Starting re-auth for '{Path(path).name}'...")
                     await self.initialize_token(path, force_interactive=True)
+                    await self._clear_credential_health_block(path, reason="reauth_success")
                     lib_logger.info(f"Re-auth SUCCESS for '{Path(path).name}'")
                 except Exception as e:
                     lib_logger.error(f"Re-auth FAILED for '{Path(path).name}': {e}")
@@ -973,6 +1113,7 @@ class OpenAIOAuthBase:
 
             if path:
                 await self._save_credentials(path, new_creds)
+                await self._clear_credential_health_block(path, reason="reauth_success")
 
             lib_logger.info(
                 f"{self.ENV_PREFIX} OAuth initialized successfully for '{display_name}'."
@@ -1027,6 +1168,12 @@ class OpenAIOAuthBase:
         lib_logger.debug(f"Initializing {self.ENV_PREFIX} token for '{display_name}'...")
 
         try:
+            if path and self._has_durable_health_block(path) and not force_interactive:
+                raise CredentialNeedsReauthError(
+                    credential_path=path,
+                    message=f"Credential '{Path(path).name}' requires manual re-authentication.",
+                )
+
             creds = (
                 await self._load_credentials(creds_or_path) if path else creds_or_path
             )
@@ -1067,7 +1214,11 @@ class OpenAIOAuthBase:
                 )
 
                 if path and not is_auto_oauth_reauth_enabled():
-                    self._unavailable_credentials[path] = time.time()
+                    await self._mark_credential_needs_reauth(
+                        path,
+                        reason="manual_reauth_required",
+                        source="oauth_initialize",
+                    )
                     raise ValueError(
                         f"Automatic interactive OAuth is disabled for '{display_name}'. "
                         "Run the credential tool to re-authenticate manually, or set "
@@ -1097,6 +1248,12 @@ class OpenAIOAuthBase:
     async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
         """Get auth header with graceful degradation if refresh fails."""
         try:
+            if self._has_durable_health_block(credential_path):
+                raise CredentialNeedsReauthError(
+                    credential_path=credential_path,
+                    message=f"Credential '{Path(credential_path).name}' requires manual re-authentication.",
+                )
+
             creds = await self._load_credentials(credential_path)
 
             # Prefer API key if available
@@ -1137,6 +1294,10 @@ class OpenAIOAuthBase:
             return {"Authorization": f"Bearer {token}"}
 
         except Exception as e:
+            if isinstance(e, CredentialNeedsReauthError) or self._has_durable_health_block(
+                credential_path
+            ):
+                raise
             cached = self._credentials_cache.get(credential_path)
             if cached and (cached.get("access_token") or cached.get("api_key")):
                 if self._is_access_token_only_credential(cached) and self._is_token_truly_expired(cached):
@@ -1155,6 +1316,8 @@ class OpenAIOAuthBase:
 
     async def proactively_refresh(self, credential_path: str):
         """Proactively refresh a credential by queueing it for refresh."""
+        if self._has_durable_health_block(credential_path):
+            return
         creds = await self._load_credentials(credential_path)
         if self._is_access_token_only_credential(creds):
             return
@@ -1302,6 +1465,9 @@ class OpenAIOAuthBase:
                 )
 
             await self._save_credentials(str(file_path), new_creds)
+            await self._clear_credential_health_block(
+                str(file_path), reason="reauth_success"
+            )
 
             return CredentialSetupResult(
                 success=True,

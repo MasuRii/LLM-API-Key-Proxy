@@ -11,7 +11,7 @@ if a credential is available for use.
 import logging
 from typing import Dict, List, Optional
 
-from ..types import CredentialState, LimitCheckResult, LimitResult
+from ..types import CredentialState, LimitCheckResult
 from ..config import ProviderUsageConfig
 from ..tracking.windows import WindowManager
 from .base import LimitChecker
@@ -19,8 +19,8 @@ from .concurrent import ConcurrentLimitChecker
 from .window_limits import WindowLimitChecker
 from .cooldowns import CooldownChecker
 from .fair_cycle import FairCycleChecker
+from .health import CredentialHealthChecker
 from .custom_caps import CustomCapChecker
-from ...error_handler import mask_credential
 from ...error_handler import mask_credential
 
 lib_logger = logging.getLogger("rotator_library")
@@ -49,11 +49,13 @@ class LimitEngine:
         self._config = config
         self._window_manager = window_manager
 
-        # Initialize all limit checkers
-        # Order matters: concurrent first (fast check), then others
+        # Initialize all limit checkers.
+        # Order matters: concurrent is fast, then durable health blocks must
+        # run before cooldown/window/fair-cycle checks.
         # Note: WindowLimitChecker is optional - only included if window_limits_enabled
         self._checkers: List[LimitChecker] = [
             ConcurrentLimitChecker(),
+            CredentialHealthChecker(),
             CooldownChecker(),
         ]
 
@@ -71,7 +73,8 @@ class LimitEngine:
 
         # Quick access to specific checkers
         self._concurrent_checker = self._checkers[0]
-        self._cooldown_checker = self._checkers[1]
+        self._health_checker = self._checkers[1]
+        self._cooldown_checker = self._checkers[2]
 
     def check_all(
         self,
@@ -204,6 +207,11 @@ class LimitEngine:
     def cooldown_checker(self) -> CooldownChecker:
         """Get the cooldown checker."""
         return self._cooldown_checker
+
+    @property
+    def health_checker(self) -> CredentialHealthChecker:
+        """Get the credential health checker."""
+        return self._health_checker
 
     @property
     def window_checker(self) -> WindowLimitChecker:
