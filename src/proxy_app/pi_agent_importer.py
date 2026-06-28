@@ -31,6 +31,7 @@ SUPPORTED_PROVIDER_APIS = {
 # Windows rejects individual environment variable values above 32,767 chars.
 # Leave headroom for implementation-specific accounting and fall back to a file.
 MAX_ENV_VALUE_LENGTH = 30_000
+_PI_MONO_MODELS_GLOB = "*.models.ts"
 DEFAULT_AUTH_ALIASES = {
     # Pi names AI Studio credentials as "google" in auth.json, while models.json
     # exposes the OpenAI-compatible local gateway as "aistudio".
@@ -162,11 +163,27 @@ def import_pi_agent_config(
             if provider_id not in providers
         }
     )
+
+    aliases = _load_auth_aliases()
+
+    # --- Dynamically discover built-in pi-mono providers and merge ---
+    builtin_defaults = _discover_builtin_provider_defaults(
+        os.getenv("PI_MONO_PATH"),
+        root_dir,
+    )
+    for _bpid, _bpinfo in builtin_defaults.items():
+        if _bpid not in providers:
+            _bmodels = _bpinfo.get("model_ids")
+            if _bmodels and _has_matching_auth_entries(auth_data, _bpid, aliases):
+                providers[_bpid] = {
+                    "api": _bpinfo.get("api", ""),
+                    "baseUrl": _bpinfo.get("baseUrl", ""),
+                    "models": [{"id": mid} for mid in _bmodels],
+                }
+
     if not isinstance(providers_raw, dict) and not providers:
         summary.warnings.append("PI_AGENT_MODELS_PATH does not contain a providers object.")
         return summary
-
-    aliases = _load_auth_aliases()
     skip_providers = _load_csv_env("PI_AGENT_SKIP_PROVIDERS")
     cache_payload: dict[str, Any] = {
         "source": {
@@ -188,11 +205,23 @@ def import_pi_agent_config(
             continue
 
         api_type = str(provider_config.get("api") or "").strip()
+        if not api_type:
+            _bp = builtin_defaults.get(pi_provider_id, {})
+            api_type = str(_bp.get("api") or "openai-completions").strip()
         if api_type not in SUPPORTED_PROVIDER_APIS:
             summary.skipped.append(f"{pi_provider_id}: unsupported api '{api_type}'")
             continue
 
         base_url = str(provider_config.get("baseUrl") or "").strip()
+        if not base_url:
+            _bp = builtin_defaults.get(pi_provider_id, {})
+            _candidate = str(_bp.get("baseUrl") or "").strip()
+            if _candidate and "{" not in _candidate:
+                base_url = _candidate
+            else:
+                base_url = _find_auth_base_url(
+                    auth_data, pi_provider_id, aliases,
+                )
         if not base_url:
             summary.skipped.append(f"{pi_provider_id}: missing baseUrl")
             continue
@@ -1181,3 +1210,144 @@ def _write_cache(
     except OSError as exc:
         summary.warnings.append(f"PI agent cache could not be written: {exc}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Built-in pi-mono provider discovery
+# ---------------------------------------------------------------------------
+
+def _discover_builtin_provider_defaults(
+    pi_mono_path_env: str | None,
+    root_dir: Path,
+) -> dict[str, dict[str, Any]]:
+    """Dynamically discover built-in provider configs from pi-mono source.
+
+    Scans ``*.models.ts`` files in the pi-mono providers directory to extract
+    each provider's API type, base URL, and model IDs.  Results are cached so
+    the filesystem is only scanned once per process.
+    """
+    mono_root = _find_pi_mono_root(pi_mono_path_env, root_dir)
+    if mono_root is None:
+        return {}
+
+    providers_dir = mono_root / "packages" / "ai" / "src" / "providers"
+    if not providers_dir.is_dir():
+        return {}
+
+    defaults: dict[str, dict[str, Any]] = {}
+    for models_file in sorted(providers_dir.glob(_PI_MONO_MODELS_GLOB)):
+        try:
+            content = models_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        provider_ids = re.findall(r'provider:\s+"([^"]+)"', content)
+        if not provider_ids:
+            continue
+        provider_id = provider_ids[0]
+
+        apis = re.findall(r'\bapi:\s+"([^"]+)"', content)
+        # Prefer openai-completions if multiple APIs are available (most common)
+        api_type = "openai-completions" if "openai-completions" in apis else (apis[0] if apis else "")
+
+        base_urls = re.findall(r'baseUrl:\s+"([^"]+)"', content)
+        # Prefer URLs without template variables and with /v1 suffix
+        base_url = ""
+        for url in base_urls:
+            if "{" not in url:
+                base_url = url
+                break
+        if not base_url and base_urls:
+            base_url = base_urls[0]
+
+        model_ids = re.findall(r'^\t"([^"]+)":\s+\{', content, re.MULTILINE)
+
+        defaults[provider_id] = {
+            "api": api_type,
+            "baseUrl": base_url,
+            "model_ids": model_ids,
+        }
+
+    return defaults
+
+
+def _find_pi_mono_root(
+    pi_mono_path_env: str | None,
+    root_dir: Path,
+) -> Path | None:
+    """Locate the pi-mono repository root directory.
+
+    Search order:
+      1. ``PI_MONO_PATH`` environment variable
+      2. Sibling directory of the proxy root (``root_dir/.. / pi-mono``)
+      3. Common development paths relative to the proxy root
+    """
+    resolved_root = root_dir.resolve()
+    candidates: list[Path] = []
+
+    if pi_mono_path_env:
+        candidates.append(_resolve_path(pi_mono_path_env))
+
+    # Sibling of the proxy project root
+    parent = resolved_root.parent
+    candidates.append(parent / "pi-mono")
+
+    # Also check two levels up (e.g. ~/repos/pi-mono)
+    grandparent = parent.parent if parent else resolved_root
+    candidates.append(grandparent / "pi-mono")
+
+    for candidate in _dedupe_paths(candidates):
+        providers_dir = candidate / "packages" / "ai" / "src" / "providers"
+        if providers_dir.is_dir():
+            return candidate
+
+    return None
+
+
+def _find_auth_base_url(
+    auth_data: dict[str, Any],
+    provider_id: str,
+    aliases: dict[str, list[str]],
+) -> str:
+    """Return the first matching auth entry's ``request.baseUrl``.
+
+    Used as a fallback when a provider has no global base URL (e.g. per-account
+    Cloudflare Workers AI endpoints).
+    """
+    candidate_names = [provider_id]
+    candidate_names.extend(aliases.get(provider_id.lower(), []))
+    normalized_candidates = {_normalize_auth_name(name) for name in candidate_names}
+
+    for auth_name, auth_config in auth_data.items():
+        if not isinstance(auth_config, dict):
+            continue
+        if _auth_match_sort_key(auth_name, normalized_candidates) is None:
+            continue
+        request = auth_config.get("request")
+        if isinstance(request, dict):
+            url = request.get("baseUrl")
+            if isinstance(url, str) and url.strip():
+                return url.strip().rstrip("/")
+    return ""
+
+
+def _has_matching_auth_entries(
+    auth_data: dict[str, Any],
+    provider_id: str,
+    aliases: dict[str, list[str]],
+) -> bool:
+    """Return True if *any* auth entry matches the given provider ID.
+
+    Lightweight check used before synthesising built-in provider entries to
+    avoid adding providers that have no credentials in the local auth store.
+    """
+    candidate_names = [provider_id]
+    candidate_names.extend(aliases.get(provider_id.lower(), []))
+    normalized_candidates = {_normalize_auth_name(name) for name in candidate_names}
+
+    for auth_name, auth_config in auth_data.items():
+        if not isinstance(auth_config, dict):
+            continue
+        if _auth_match_sort_key(auth_name, normalized_candidates) is not None:
+            return True
+    return False
