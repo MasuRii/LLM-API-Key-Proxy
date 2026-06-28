@@ -154,6 +154,9 @@ _FALLBACK_CONTEXT_LIMITS: Dict[str, int] = {
 _models_cache: Optional[Dict[str, Any]] = None
 _models_cache_time: float = 0.0
 
+# Raw upstream models.json for Codex CLI passthrough ({"models": [...]})
+_raw_models_catalog: Optional[List[Dict[str, Any]]] = None
+
 
 def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
     """
@@ -182,6 +185,9 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
         base_models = []
         reasoning_efforts = {}
         context_limits: Dict[str, int] = {}
+
+        global _raw_models_catalog
+        _raw_models_catalog = models_list
 
         for m in models_list:
             slug = m.get("slug", "")
@@ -303,6 +309,19 @@ def get_model_context_limits() -> Dict[str, int]:
     does not have a two-tier concept. Returns dict of slug -> effective_window.
     """
     return _get_model_data().get("context_limits", {})
+
+
+def get_raw_models_catalog() -> Optional[List[Dict[str, Any]]]:
+    """
+    Return the raw upstream models.json catalog for Codex CLI passthrough.
+
+    Codex CLI expects {"models": [...]} with full ModelInfo objects (slug,
+    display_name, context_window, etc.) rather than the OpenAI-compatible
+    {"object": "list", "data": [...]}.  Ensures the cache is populated
+    before returning.
+    """
+    _get_model_data()
+    return _raw_models_catalog
 
 
 # For backward compatibility / class-level references that need a static list at import time,
