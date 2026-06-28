@@ -4,11 +4,14 @@
 # src/rotator_library/credential_tool.py
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from dotenv import set_key, get_key
 
 # NOTE: Heavy imports (provider_factory, PROVIDER_PLUGINS) are deferred
@@ -71,6 +74,17 @@ OAUTH_FRIENDLY_NAMES = {
     "codex": "OpenAI Codex",
     "anthropic": "Claude / Claude Code (Pro & Max)",
     "copilot": "GitHub Copilot",
+}
+
+DEFAULT_OAUTH_CLEANUP_STATUSES = ("needs_reauth", "cooldown", "exhausted")
+OAUTH_CLEANUP_STATUS_CHOICES = (*DEFAULT_OAUTH_CLEANUP_STATUSES, "active")
+OAUTH_CLEANUP_STATUS_PRIORITY = {
+    "needs_reauth": 0,
+    "exhausted": 1,
+    "cooldown": 2,
+    "active": 3,
+    "unknown": 4,
+    "error": 5,
 }
 
 
@@ -181,6 +195,24 @@ def _get_api_keys_from_env() -> dict:
     return api_keys
 
 
+def _api_key_provider_from_name(key_name: str) -> str | None:
+    """Return the provider prefix for a .env API key name."""
+    if key_name.startswith("PROXY_"):
+        return None
+    match = re.fullmatch(r"(.+?)_API_KEY(?:_\d+)?", key_name)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+def _oauth_provider_from_filename(filename: str) -> str | None:
+    """Return the provider prefix for an OAuth credential filename."""
+    match = re.fullmatch(r"(.+?)_oauth_\d+\.json", filename)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
 def _delete_api_key_from_env(key_name: str) -> bool:
     """
     Delete an API key from the .env file with safety backup and comparison.
@@ -265,6 +297,339 @@ def _delete_api_key_from_env(key_name: str) -> bool:
         return False
 
 
+def _normalize_oauth_status_value(status: Any) -> str:
+    """Normalize an OAuth/usage status token for cleanup filtering."""
+    normalized = str(status or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "needs_reauthentication": "needs_reauth",
+        "reauth_required": "needs_reauth",
+        "requires_reauth": "needs_reauth",
+        "rate_limited": "cooldown",
+        "rate_limit": "cooldown",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _prefer_oauth_cleanup_status(existing: str | None, new_status: str) -> str:
+    """Keep the most cleanup-relevant status when multiple usage scopes disagree."""
+    if not existing:
+        return new_status
+    if not new_status:
+        return existing
+    existing_priority = OAUTH_CLEANUP_STATUS_PRIORITY.get(existing, 99)
+    new_priority = OAUTH_CLEANUP_STATUS_PRIORITY.get(new_status, 99)
+    return new_status if new_priority < existing_priority else existing
+
+
+def _usage_index_key(value: Any) -> str:
+    """Return a case-insensitive key for status indexes."""
+    return str(value or "").strip().lower()
+
+
+def _usage_accessor_index_keys(accessor: Any) -> set[str]:
+    """Build lookup keys for a usage accessor/path without exposing its value."""
+    raw = str(accessor or "").strip()
+    if not raw or (not raw.endswith(".json") and "/" not in raw and "\\" not in raw):
+        return set()
+
+    variants = {raw, raw.replace("\\", "/")}
+    try:
+        path = Path(raw)
+        if path.name:
+            variants.add(path.name)
+        if path.exists():
+            resolved = str(path.resolve())
+            variants.add(resolved)
+            variants.add(resolved.replace("\\", "/"))
+    except Exception:
+        pass
+
+    return {_usage_index_key(variant) for variant in variants if variant}
+
+
+def _remember_usage_status(mapping: dict[str, str], key: Any, status: str) -> None:
+    """Store a status in an index, preserving the most cleanup-relevant status."""
+    normalized_key = _usage_index_key(key)
+    if not normalized_key:
+        return
+    mapping[normalized_key] = _prefer_oauth_cleanup_status(
+        mapping.get(normalized_key),
+        status,
+    )
+
+
+def _usage_provider_from_filename(filename: str) -> str | None:
+    """Extract a provider name from a usage_<provider>.json file."""
+    match = re.fullmatch(r"usage_(.+)\.json", filename)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+def _provider_quota_group_context(provider: str) -> tuple[frozenset[str], frozenset[str]]:
+    """Return hidden and defined quota groups for status derivation."""
+    try:
+        _, provider_plugins = _ensure_providers_loaded()
+        plugin_class = provider_plugins.get(provider)
+        if not plugin_class:
+            return frozenset(), frozenset()
+
+        hidden_groups = frozenset(
+            str(group) for group in (getattr(plugin_class, "hidden_quota_groups", None) or ())
+        )
+        model_quota_groups = getattr(plugin_class, "model_quota_groups", None) or {}
+        if isinstance(model_quota_groups, dict):
+            defined_groups = frozenset(str(group) for group in model_quota_groups.keys())
+        else:
+            defined_groups = frozenset(str(group) for group in model_quota_groups)
+        return hidden_groups, defined_groups
+    except Exception:
+        return frozenset(), frozenset()
+
+
+def _timestamp_is_future(value: Any, now: float) -> bool:
+    """Return True when a serialized timestamp is still active."""
+    try:
+        return float(value or 0) > now
+    except (TypeError, ValueError):
+        return False
+
+
+def _resolve_usage_credential_state_status(
+    state: dict[str, Any],
+    *,
+    now: float,
+    hidden_groups: frozenset[str],
+    defined_groups: frozenset[str],
+) -> str:
+    """Resolve cleanup status from persisted usage/cooldown health state."""
+    snapshot = state.get("status_snapshot")
+    if isinstance(snapshot, dict) and snapshot.get("status"):
+        return _normalize_oauth_status_value(snapshot["status"])
+
+    health = state.get("credential_health") or state.get("health_block")
+    if isinstance(health, dict):
+        health_status = _normalize_oauth_status_value(health.get("status"))
+        if bool(health.get("blocked")) and health_status == "needs_reauth":
+            return "needs_reauth"
+
+    cooldowns = state.get("cooldowns") or {}
+    if not isinstance(cooldowns, dict):
+        cooldowns = {}
+
+    active_cooldowns = {
+        str(key): cooldown
+        for key, cooldown in cooldowns.items()
+        if isinstance(cooldown, dict)
+        and _timestamp_is_future(cooldown.get("until"), now)
+    }
+    if not active_cooldowns:
+        return "active"
+
+    if "_global_" in active_cooldowns:
+        return "cooldown"
+
+    cooldown_groups = set(active_cooldowns)
+    if hidden_groups and cooldown_groups & hidden_groups:
+        return "exhausted"
+
+    group_usage = state.get("group_usage") or {}
+    known_groups = set(str(group) for group in group_usage.keys()) if isinstance(group_usage, dict) else set()
+    if defined_groups:
+        known_groups &= defined_groups
+    visible_known_groups = known_groups - hidden_groups if hidden_groups else known_groups
+
+    if visible_known_groups and cooldown_groups >= visible_known_groups:
+        return "exhausted"
+
+    return "cooldown"
+
+
+def _oauth_stable_id_from_payload(data: dict[str, Any]) -> str:
+    """Build the OAuth stable ID used by usage storage from a credential payload."""
+    metadata = data.get("_proxy_metadata", {}) if isinstance(data, dict) else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    stable = metadata.get("login") or metadata.get("email")
+    if not stable:
+        for field in ("login", "email", "client_email", "account"):
+            if data.get(field):
+                stable = data[field]
+                break
+    if not stable:
+        return ""
+
+    account_id = data.get("account_id") or metadata.get("account_id")
+    return f"{stable}::{account_id}" if account_id else str(stable)
+
+
+def _get_oauth_usage_status_index() -> dict[str, dict[str, dict[str, str]]]:
+    """Load persisted usage statuses keyed by provider, stable ID, and accessor."""
+    usage_dir = get_data_file("usage")
+    if not usage_dir.exists() or not usage_dir.is_dir():
+        return {}
+
+    status_index: dict[str, dict[str, dict[str, str]]] = {}
+    provider_contexts: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
+    now = time.time()
+
+    for usage_file in sorted(usage_dir.rglob("usage_*.json")):
+        provider = _usage_provider_from_filename(usage_file.name)
+        if not provider:
+            continue
+
+        try:
+            with open(usage_file, "r", encoding="utf-8") as f:
+                usage_data = json.load(f)
+        except Exception:
+            continue
+
+        credentials = usage_data.get("credentials", {})
+        if not isinstance(credentials, dict):
+            continue
+
+        hidden_groups, defined_groups = provider_contexts.setdefault(
+            provider,
+            _provider_quota_group_context(provider),
+        )
+        provider_index = status_index.setdefault(
+            provider,
+            {"stable_ids": {}, "accessors": {}, "filenames": {}},
+        )
+
+        for stable_id, state in credentials.items():
+            if not isinstance(state, dict):
+                continue
+
+            status = _resolve_usage_credential_state_status(
+                state,
+                now=now,
+                hidden_groups=hidden_groups,
+                defined_groups=defined_groups,
+            )
+            _remember_usage_status(provider_index["stable_ids"], stable_id, status)
+
+            accessor = state.get("accessor")
+            for key in _usage_accessor_index_keys(accessor):
+                _remember_usage_status(provider_index["accessors"], key, status)
+            filename = (
+                Path(str(accessor)).name
+                if accessor and str(accessor).lower().endswith(".json")
+                else ""
+            )
+            if filename:
+                _remember_usage_status(provider_index["filenames"], filename, status)
+
+        accessor_index = usage_data.get("accessor_index", {})
+        if isinstance(accessor_index, dict):
+            for accessor, stable_id in accessor_index.items():
+                status = provider_index["stable_ids"].get(_usage_index_key(stable_id))
+                if not status:
+                    continue
+                for key in _usage_accessor_index_keys(accessor):
+                    _remember_usage_status(provider_index["accessors"], key, status)
+                filename = (
+                    Path(str(accessor)).name
+                    if accessor and str(accessor).lower().endswith(".json")
+                    else ""
+                )
+                if filename:
+                    _remember_usage_status(provider_index["filenames"], filename, status)
+
+    return status_index
+
+
+def _lookup_oauth_usage_status(
+    cred_info: dict[str, Any],
+    usage_status_index: dict[str, dict[str, dict[str, str]]] | None,
+    stable_id: str = "",
+) -> str:
+    """Find a persisted usage status for an OAuth credential, if available."""
+    if not usage_status_index:
+        return ""
+
+    provider = str(cred_info.get("provider") or "").lower()
+    provider_index = usage_status_index.get(provider)
+    if not provider_index:
+        return ""
+
+    if stable_id:
+        status = provider_index["stable_ids"].get(_usage_index_key(stable_id))
+        if status:
+            return status
+
+    file_path = cred_info.get("file_path")
+    for key in _usage_accessor_index_keys(file_path):
+        status = provider_index["accessors"].get(key)
+        if status:
+            return status
+
+    filename = _oauth_credential_filename(cred_info)
+    if filename:
+        status = provider_index["filenames"].get(_usage_index_key(filename))
+        if status:
+            return status
+
+    return ""
+
+
+def _resolve_oauth_credential_status(
+    cred_info: dict[str, Any],
+    usage_status_index: dict[str, dict[str, dict[str, str]]] | None = None,
+) -> str:
+    """Resolve an OAuth credential status from usage, health, or file metadata."""
+    existing_status = _normalize_oauth_status_value(cred_info.get("status"))
+    if existing_status and existing_status not in {"unknown", "error"}:
+        return existing_status
+
+    file_path = cred_info.get("file_path")
+    if not file_path:
+        return "unknown"
+
+    local_status = ""
+    stable_id = ""
+    file_read_failed = False
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        metadata = data.get("_proxy_metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        local_status = _normalize_oauth_status_value(metadata.get("status"))
+        stable_id = _oauth_stable_id_from_payload(data)
+    except Exception:
+        file_read_failed = True
+
+    if local_status == "needs_reauth":
+        return "needs_reauth"
+
+    usage_status = _lookup_oauth_usage_status(
+        cred_info,
+        usage_status_index,
+        stable_id=stable_id,
+    )
+    if local_status == "active" and usage_status == "needs_reauth":
+        return "active"
+    if usage_status:
+        return usage_status
+
+    if local_status:
+        return local_status
+    if file_read_failed:
+        return "error"
+    return "active"
+
+
+def _oauth_credential_filename(cred_info: dict) -> str:
+    """Return a stable filename for an OAuth credential info dict."""
+    filename = cred_info.get("filename")
+    if filename:
+        return Path(str(filename)).name
+    file_path = cred_info.get("file_path")
+    return Path(str(file_path)).name if file_path else ""
+
+
 def _get_oauth_credentials_summary() -> dict:
     """
     Get a summary of all OAuth credentials for all providers.
@@ -276,12 +641,20 @@ def _get_oauth_credentials_summary() -> dict:
     provider_factory, _ = _ensure_providers_loaded()
     oauth_providers = provider_factory.get_available_providers()
     oauth_summary = {}
+    usage_status_index = _get_oauth_usage_status_index()
 
     for provider_name in oauth_providers:
         try:
             auth_class = provider_factory.get_provider_auth_class(provider_name)
             auth_instance = auth_class()
             credentials = auth_instance.list_credentials(_get_oauth_base_dir())
+            for cred in credentials:
+                cred.setdefault("provider", provider_name)
+                cred.setdefault("filename", _oauth_credential_filename(cred))
+                cred["status"] = _resolve_oauth_credential_status(
+                    cred,
+                    usage_status_index=usage_status_index,
+                )
             oauth_summary[provider_name] = credentials
         except Exception:
             oauth_summary[provider_name] = []
@@ -299,6 +672,569 @@ def _get_all_credentials_summary() -> dict:
     return {
         "api_keys": _get_api_keys_from_env(),
         "oauth": _get_oauth_credentials_summary(),
+    }
+
+
+def _normalize_oauth_cleanup_statuses(
+    statuses: list[str] | tuple[str, ...] | None,
+) -> set[str]:
+    """Normalize user-selected cleanup statuses for OAuth credential filtering."""
+    selected = statuses or DEFAULT_OAUTH_CLEANUP_STATUSES
+    normalized = {
+        str(status).strip().lower()
+        for status in selected
+        if str(status).strip()
+    }
+    return normalized or set(DEFAULT_OAUTH_CLEANUP_STATUSES)
+
+
+def _credential_file_path_for_filename(filename: str) -> Path | None:
+    """Resolve a credential filename under the OAuth base directory without allowing traversal."""
+    if Path(filename).name != filename or "\\" in filename:
+        return None
+
+    base_dir = _get_oauth_base_dir()
+    target = base_dir / filename
+    try:
+        if not target.resolve().is_relative_to(base_dir.resolve()):
+            return None
+    except OSError:
+        return None
+    return target
+
+
+def _api_key_stable_id_from_value(key_value: str) -> str:
+    """Return the usage stable ID for a raw API key without exposing the key."""
+    return hashlib.sha256(key_value.encode()).hexdigest()[:12]
+
+
+def _oauth_number_from_filename(filename: str) -> str:
+    """Extract the numeric OAuth credential suffix from a credential filename."""
+    match = re.fullmatch(r".+?_oauth_(\d+)\.json", filename)
+    return match.group(1) if match else ""
+
+
+def _read_oauth_stable_id_from_file(file_path: str) -> str:
+    """Read an OAuth credential stable ID before the credential file is deleted."""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return _oauth_stable_id_from_payload(data)
+    except Exception:
+        return ""
+
+
+def _candidate_usage_cleanup_identity(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Build non-secret identity keys used to remove persisted usage leftovers."""
+    provider = str(candidate.get("provider") or "").lower()
+    stable_ids = {
+        str(candidate.get("stable_id") or ""),
+        str(candidate.get("usage_stable_id") or ""),
+    }
+    accessors = set(candidate.get("usage_accessors") or [])
+    filenames = set(candidate.get("usage_filenames") or [])
+
+    if candidate.get("type") == "oauth":
+        file_path = str(candidate.get("file_path") or "")
+        filename = str(candidate.get("filename") or (Path(file_path).name if file_path else ""))
+        if file_path:
+            accessors.add(file_path)
+        if filename:
+            filenames.add(filename)
+            number = _oauth_number_from_filename(filename)
+            if provider and number:
+                accessors.add(f"env://{provider}/{number}")
+        if not any(stable_ids) and file_path:
+            stable_ids.add(_read_oauth_stable_id_from_file(file_path))
+
+    return {
+        "provider": provider,
+        "stable_ids": {value for value in stable_ids if value},
+        "accessors": {value for value in accessors if value},
+        "filenames": {value for value in filenames if value},
+    }
+
+
+def _usage_cleanup_accessor_keys(values: set[str]) -> set[str]:
+    """Return normalized accessor lookup keys for usage cleanup."""
+    keys: set[str] = set()
+    for value in values:
+        keys.update(_usage_accessor_index_keys(value))
+        if value:
+            keys.add(_usage_index_key(value))
+    return {key for key in keys if key}
+
+
+def _usage_cleanup_filename_key(value: Any) -> str:
+    """Return a normalized filename key for usage cleanup."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return _usage_index_key(Path(raw).name)
+
+
+def _usage_cleanup_matches_state(
+    stable_id: str,
+    state: dict[str, Any],
+    *,
+    stable_ids: set[str],
+    accessors: set[str],
+    filenames: set[str],
+) -> bool:
+    """Return True when a usage credential state belongs to a deleted credential."""
+    if _usage_index_key(stable_id) in stable_ids:
+        return True
+    if _usage_accessor_index_keys(stable_id) & accessors:
+        return True
+    stable_id_filename = _usage_cleanup_filename_key(stable_id)
+    if stable_id_filename and stable_id_filename in filenames:
+        return True
+
+    accessor = state.get("accessor") if isinstance(state, dict) else None
+    if _usage_accessor_index_keys(accessor) & accessors:
+        return True
+
+    filename = _usage_cleanup_filename_key(accessor)
+    return bool(filename and filename in filenames)
+
+
+def _usage_cleanup_matches_accessor_index(
+    accessor: str,
+    stable_id: str,
+    *,
+    stable_ids: set[str],
+    accessors: set[str],
+    filenames: set[str],
+) -> bool:
+    """Return True when an accessor_index entry belongs to a deleted credential."""
+    if _usage_index_key(stable_id) in stable_ids:
+        return True
+    if _usage_accessor_index_keys(stable_id) & accessors:
+        return True
+    stable_id_filename = _usage_cleanup_filename_key(stable_id)
+    if stable_id_filename and stable_id_filename in filenames:
+        return True
+    if _usage_accessor_index_keys(accessor) & accessors:
+        return True
+    filename = _usage_cleanup_filename_key(accessor)
+    return bool(filename and filename in filenames)
+
+
+def _write_usage_file(path: Path, usage_data: dict[str, Any]) -> None:
+    """Write a usage JSON file after local credential cleanup."""
+    usage_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(usage_data, f, indent=2)
+        f.write("\n")
+
+
+def _cleanup_deleted_credential_usage(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Remove usage entries and accessor indexes for a deleted credential."""
+    identity = _candidate_usage_cleanup_identity(candidate)
+    provider = identity["provider"]
+    if not provider:
+        return {
+            "success": False,
+            "files_scanned": 0,
+            "files_updated": 0,
+            "removed_credentials": 0,
+            "removed_accessors": 0,
+            "leftovers": [],
+            "errors": ["provider is required for usage cleanup"],
+        }
+
+    usage_dir = get_data_file("usage")
+    if not usage_dir.exists() or not usage_dir.is_dir():
+        return {
+            "success": True,
+            "files_scanned": 0,
+            "files_updated": 0,
+            "removed_credentials": 0,
+            "removed_accessors": 0,
+            "leftovers": [],
+            "errors": [],
+        }
+
+    selected_stable_ids = {_usage_index_key(value) for value in identity["stable_ids"]}
+    selected_accessors = _usage_cleanup_accessor_keys(identity["accessors"])
+    selected_filenames = {
+        _usage_cleanup_filename_key(value) for value in identity["filenames"]
+    }
+    selected_filenames = {value for value in selected_filenames if value}
+
+    files_scanned = 0
+    files_updated = 0
+    removed_credentials = 0
+    removed_accessors = 0
+    leftovers: list[dict[str, str]] = []
+    errors: list[str] = []
+
+    for usage_file in sorted(usage_dir.rglob(f"usage_{provider}.json")):
+        files_scanned += 1
+        try:
+            with open(usage_file, "r", encoding="utf-8") as f:
+                usage_data = json.load(f)
+        except Exception as exc:
+            errors.append(f"{usage_file}: failed to read usage file ({exc})")
+            continue
+
+        if not isinstance(usage_data, dict):
+            errors.append(f"{usage_file}: usage file root is not an object")
+            continue
+
+        changed = False
+        removed_stable_ids: set[str] = set()
+        credentials = usage_data.get("credentials", {})
+        if isinstance(credentials, dict):
+            for stable_id, state in list(credentials.items()):
+                if not isinstance(state, dict):
+                    continue
+                if _usage_cleanup_matches_state(
+                    stable_id,
+                    state,
+                    stable_ids=selected_stable_ids,
+                    accessors=selected_accessors,
+                    filenames=selected_filenames,
+                ):
+                    removed_stable_ids.add(_usage_index_key(stable_id))
+                    credentials.pop(stable_id, None)
+                    removed_credentials += 1
+                    changed = True
+
+        cleanup_stable_ids = selected_stable_ids | removed_stable_ids
+        accessor_index = usage_data.get("accessor_index", {})
+        if isinstance(accessor_index, dict):
+            for accessor, stable_id in list(accessor_index.items()):
+                if _usage_cleanup_matches_accessor_index(
+                    accessor,
+                    stable_id,
+                    stable_ids=cleanup_stable_ids,
+                    accessors=selected_accessors,
+                    filenames=selected_filenames,
+                ):
+                    accessor_index.pop(accessor, None)
+                    removed_accessors += 1
+                    changed = True
+
+        if changed:
+            try:
+                _write_usage_file(usage_file, usage_data)
+                files_updated += 1
+            except Exception as exc:
+                errors.append(f"{usage_file}: failed to write usage cleanup ({exc})")
+                continue
+
+        credentials = usage_data.get("credentials", {})
+        if isinstance(credentials, dict):
+            for stable_id, state in credentials.items():
+                if isinstance(state, dict) and _usage_cleanup_matches_state(
+                    stable_id,
+                    state,
+                    stable_ids=selected_stable_ids,
+                    accessors=selected_accessors,
+                    filenames=selected_filenames,
+                ):
+                    leftovers.append(
+                        {
+                            "file": str(usage_file),
+                            "section": "credentials",
+                            "identifier": str(stable_id),
+                        }
+                    )
+
+        accessor_index = usage_data.get("accessor_index", {})
+        if isinstance(accessor_index, dict):
+            for accessor, stable_id in accessor_index.items():
+                if _usage_cleanup_matches_accessor_index(
+                    accessor,
+                    stable_id,
+                    stable_ids=selected_stable_ids,
+                    accessors=selected_accessors,
+                    filenames=selected_filenames,
+                ):
+                    leftovers.append(
+                        {
+                            "file": str(usage_file),
+                            "section": "accessor_index",
+                            "identifier": str(accessor),
+                        }
+                    )
+
+    return {
+        "success": not errors and not leftovers,
+        "files_scanned": files_scanned,
+        "files_updated": files_updated,
+        "removed_credentials": removed_credentials,
+        "removed_accessors": removed_accessors,
+        "leftovers": leftovers,
+        "errors": errors,
+    }
+
+
+def _preview_oauth_cleanup_candidates(
+    statuses: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """
+    Preview OAuth credentials matching cleanup statuses without deleting anything.
+
+    By default this returns credentials needing attention: needs_reauth, cooldown,
+    and exhausted. Active credentials are skipped unless the caller explicitly
+    includes active in ``statuses``.
+    """
+    selected_statuses = _normalize_oauth_cleanup_statuses(statuses)
+    candidates = []
+
+    oauth_summary = _get_oauth_credentials_summary()
+    for provider, credentials in sorted(oauth_summary.items()):
+        for credential in credentials or []:
+            status = _resolve_oauth_credential_status(credential)
+            if status not in selected_statuses:
+                continue
+
+            file_path = credential.get("file_path", "")
+            filename = credential.get("filename") or (
+                Path(file_path).name if file_path else ""
+            )
+            provider_name = str(credential.get("provider") or provider).lower()
+            candidates.append(
+                {
+                    "type": "oauth",
+                    "provider": provider_name,
+                    "identifier": filename,
+                    "filename": filename,
+                    "file_path": str(file_path),
+                    "email": credential.get("email", "unknown"),
+                    "status": status,
+                }
+            )
+
+    return {
+        "statuses": sorted(selected_statuses),
+        "candidates": candidates,
+        "total": len(candidates),
+    }
+
+
+def _validate_batch_delete_item(
+    item: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Validate one selected credential for batch deletion."""
+    item_type = str(item.get("type", "")).lower()
+    provider = str(item.get("provider", "")).lower()
+    if item_type not in {"api_key", "oauth"}:
+        return None, {
+            "type": item_type or "unknown",
+            "provider": provider,
+            "identifier": str(item.get("key_name") or item.get("filename") or ""),
+            "detail": "type must be api_key or oauth",
+        }
+
+    if item_type == "api_key":
+        key_name = str(item.get("key_name") or "")
+        env_keys = _get_api_keys_from_env()
+        key_value = None
+        key_provider = _api_key_provider_from_name(key_name)
+        if not key_name:
+            detail = "key_name is required for API key deletion"
+        elif key_provider != provider:
+            detail = f"API key {key_name} does not belong to provider {provider}"
+        else:
+            for discovered_provider, provider_keys in env_keys.items():
+                if discovered_provider.lower() != provider:
+                    continue
+                for discovered_name, discovered_value in provider_keys:
+                    if discovered_name == key_name:
+                        key_value = discovered_value
+                        break
+        if key_value is None:
+            detail = locals().get("detail", f"Key {key_name} not found")
+            return None, {
+                "type": item_type,
+                "provider": provider,
+                "identifier": key_name,
+                "detail": detail,
+            }
+        return {
+            "type": item_type,
+            "provider": provider,
+            "identifier": key_name,
+            "key_name": key_name,
+            "stable_id": _api_key_stable_id_from_value(key_value),
+        }, None
+
+    filename = str(item.get("filename") or "")
+    target = _credential_file_path_for_filename(filename)
+    provided_path = Path(str(item["file_path"])) if item.get("file_path") else None
+    file_provider = _oauth_provider_from_filename(filename)
+    if not filename:
+        detail = "filename is required for OAuth deletion"
+    elif file_provider != provider:
+        detail = f"OAuth credential {filename} does not belong to provider {provider}"
+    elif target is None or not target.exists() or not target.is_file():
+        detail = "OAuth credential not found"
+    elif provided_path and provided_path.resolve() != target.resolve():
+        detail = "file_path does not match the configured OAuth credential directory"
+    else:
+        stable_id = _read_oauth_stable_id_from_file(str(target))
+        usage_accessors = [str(target)]
+        credential_number = _oauth_number_from_filename(filename)
+        if credential_number:
+            usage_accessors.append(f"env://{provider}/{credential_number}")
+        return {
+            "type": item_type,
+            "provider": provider,
+            "identifier": filename,
+            "filename": filename,
+            "file_path": str(target),
+            "stable_id": stable_id,
+            "usage_accessors": usage_accessors,
+            "usage_filenames": [filename],
+        }, None
+
+    return None, {
+        "type": item_type,
+        "provider": provider,
+        "identifier": filename,
+        "detail": detail,
+    }
+
+
+def _delete_oauth_credential_file(provider: str, file_path: str) -> bool:
+    """Delete an OAuth credential via the provider auth class when available."""
+    try:
+        provider_factory, _ = _ensure_providers_loaded()
+        auth_class = provider_factory.get_provider_auth_class(provider)
+        auth_instance = auth_class()
+        return bool(auth_instance.delete_credential(file_path))
+    except Exception:
+        try:
+            path = Path(file_path)
+            if not path.exists() or _oauth_provider_from_filename(path.name) != provider:
+                return False
+            path.unlink()
+            return True
+        except Exception:
+            return False
+
+
+def _batch_delete_selected_credentials(
+    items: list[dict[str, Any]],
+    *,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """
+    Validate and optionally delete selected API key/OAuth credentials.
+
+    Dry-run mode returns candidates and errors without mutating .env or OAuth files.
+    Execution requires ``confirm=True`` to make irreversible local deletions explicit.
+    """
+    candidates = []
+    errors = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for item in items:
+        candidate, error = _validate_batch_delete_item(item)
+        if error:
+            errors.append(error)
+            continue
+        if not candidate:
+            continue
+
+        duplicate_key = (candidate["type"], candidate["provider"], candidate["identifier"])
+        if duplicate_key in seen:
+            errors.append(
+                {
+                    **candidate,
+                    "detail": "Duplicate credential in request",
+                }
+            )
+            continue
+        seen.add(duplicate_key)
+        candidates.append(candidate)
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "candidates": candidates,
+            "deleted": [],
+            "errors": errors,
+        }
+
+    if not confirm:
+        return {
+            "dry_run": False,
+            "candidates": candidates,
+            "deleted": [],
+            "errors": [
+                *errors,
+                {
+                    "type": "batch",
+                    "provider": "",
+                    "identifier": "",
+                    "detail": "confirm must be true to delete credentials",
+                },
+            ],
+        }
+
+    if errors:
+        return {
+            "dry_run": False,
+            "candidates": candidates,
+            "deleted": [],
+            "errors": errors,
+        }
+
+    deleted = []
+    execution_errors = []
+    for candidate in candidates:
+        if candidate["type"] == "api_key":
+            if _delete_api_key_from_env(candidate["key_name"]):
+                usage_cleanup = _cleanup_deleted_credential_usage(candidate)
+                deleted.append({**candidate, "usage_cleanup": usage_cleanup})
+                if not usage_cleanup["success"]:
+                    execution_errors.append(
+                        {
+                            **candidate,
+                            "detail": "Deleted API key, but usage cleanup left leftovers",
+                            "usage_cleanup": usage_cleanup,
+                        }
+                    )
+            else:
+                execution_errors.append(
+                    {
+                        **candidate,
+                        "detail": "Failed to delete API key",
+                    }
+                )
+        else:
+            if _delete_oauth_credential_file(
+                candidate["provider"],
+                candidate["file_path"],
+            ):
+                usage_cleanup = _cleanup_deleted_credential_usage(candidate)
+                deleted.append({**candidate, "usage_cleanup": usage_cleanup})
+                if not usage_cleanup["success"]:
+                    execution_errors.append(
+                        {
+                            **candidate,
+                            "detail": "Deleted OAuth credential, but usage cleanup left leftovers",
+                            "usage_cleanup": usage_cleanup,
+                        }
+                    )
+            else:
+                execution_errors.append(
+                    {
+                        **candidate,
+                        "detail": "Failed to delete OAuth credential",
+                    }
+                )
+
+    return {
+        "dry_run": False,
+        "candidates": candidates,
+        "deleted": deleted,
+        "errors": execution_errors,
     }
 
 
@@ -826,6 +1762,278 @@ async def _view_oauth_credentials_detail(provider_name: str):
     input()
 
 
+def _display_batch_delete_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    title: str = "Credential Deletion Candidates",
+) -> None:
+    """Display batch deletion candidates without exposing raw credential secrets."""
+    if not candidates:
+        console.print(
+            "[bold yellow]No credential deletion candidates found.[/bold yellow]"
+        )
+        return
+
+    table = Table(title=title, box=None, padding=(0, 2))
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Type", style="cyan")
+    table.add_column("Provider", style="cyan")
+    table.add_column("Identifier", style="yellow")
+    table.add_column("Email/Status", style="green")
+
+    for i, candidate in enumerate(candidates, 1):
+        provider_name = str(candidate.get("provider", "unknown"))
+        provider = OAUTH_FRIENDLY_NAMES.get(provider_name, provider_name.title())
+        if candidate.get("type") == "api_key":
+            extra = candidate.get("masked_value", "masked")
+        else:
+            status = candidate.get("status", "unknown")
+            email = candidate.get("email", "unknown")
+            extra = f"{email} / {status}"
+        table.add_row(
+            str(i),
+            candidate.get("type", "unknown"),
+            provider,
+            candidate.get("identifier", ""),
+            extra,
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]Total: {len(candidates)} credential(s)[/dim]")
+
+
+def _display_oauth_cleanup_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    title: str = "OAuth Cleanup Candidates",
+) -> None:
+    """Display OAuth cleanup candidates without exposing raw credential secrets."""
+    _display_batch_delete_candidates(candidates, title=title)
+
+
+def _all_batch_delete_candidates() -> list[dict[str, Any]]:
+    """Build a selectable list of all API-key and OAuth credentials."""
+    candidates: list[dict[str, Any]] = []
+    for provider, keys in sorted(_get_api_keys_from_env().items()):
+        for key_name, key_value in keys:
+            masked = f"****{key_value[-4:]}" if len(key_value) > 4 else "****"
+            candidates.append(
+                {
+                    "type": "api_key",
+                    "provider": provider.lower(),
+                    "identifier": key_name,
+                    "key_name": key_name,
+                    "masked_value": masked,
+                }
+            )
+
+    oauth_summary = _get_oauth_credentials_summary()
+    for provider, credentials in sorted(oauth_summary.items()):
+        for credential in credentials or []:
+            file_path = credential.get("file_path", "")
+            filename = credential.get("filename") or (
+                Path(file_path).name if file_path else ""
+            )
+            candidates.append(
+                {
+                    "type": "oauth",
+                    "provider": str(credential.get("provider") or provider).lower(),
+                    "identifier": filename,
+                    "filename": filename,
+                    "file_path": str(file_path),
+                    "email": credential.get("email", "unknown"),
+                    "status": _resolve_oauth_credential_status(credential),
+                }
+            )
+    return candidates
+
+
+def _batch_delete_item_from_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Convert a display candidate to the helper input shape."""
+    if candidate.get("type") == "api_key":
+        return {
+            "type": "api_key",
+            "provider": candidate["provider"],
+            "key_name": candidate["key_name"],
+        }
+    return {
+        "type": "oauth",
+        "provider": candidate["provider"],
+        "filename": candidate["filename"],
+        "file_path": candidate["file_path"],
+    }
+
+
+
+def _prompt_oauth_cleanup_statuses() -> list[str]:
+    """Prompt for OAuth cleanup statuses, defaulting to non-active cleanup states."""
+    console.print("\n[bold cyan]Cleanup statuses:[/bold cyan]")
+    for i, status in enumerate(OAUTH_CLEANUP_STATUS_CHOICES, 1):
+        default_marker = (
+            " [dim](default)[/dim]"
+            if status in DEFAULT_OAUTH_CLEANUP_STATUSES
+            else ""
+        )
+        warning = " [yellow](active)[/yellow]" if status == "active" else ""
+        console.print(f"  {i}. {status}{default_marker}{warning}")
+
+    default_value = "1,2,3"
+    raw = Prompt.ask(
+        "Select status numbers or names, comma-separated",
+        default=default_value,
+        show_default=True,
+    )
+    selected = []
+    status_by_number = {
+        str(i): status for i, status in enumerate(OAUTH_CLEANUP_STATUS_CHOICES, 1)
+    }
+    valid_statuses = set(OAUTH_CLEANUP_STATUS_CHOICES)
+    for part in raw.split(","):
+        value = part.strip().lower()
+        if not value:
+            continue
+        if value in status_by_number:
+            selected.append(status_by_number[value])
+        elif value in valid_statuses:
+            selected.append(value)
+        else:
+            console.print(f"[yellow]Ignoring unknown status: {value}[/yellow]")
+
+    return selected or list(DEFAULT_OAUTH_CLEANUP_STATUSES)
+
+
+def _parse_oauth_cleanup_candidate_selection(
+    selection: str,
+    candidate_count: int,
+) -> list[int] | None:
+    """Parse comma-separated one-based candidate selections into zero-based indexes."""
+    value = selection.strip().lower()
+    if value == "b":
+        return None
+    if value == "all":
+        return list(range(candidate_count))
+
+    indexes = []
+    for part in value.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if not item.isdigit():
+            return []
+        index = int(item) - 1
+        if index < 0 or index >= candidate_count:
+            return []
+        if index not in indexes:
+            indexes.append(index)
+    return indexes
+
+
+async def _preview_oauth_cleanup_menu():
+    """Interactive preview for OAuth cleanup candidates by selected status."""
+    clear_screen("Preview OAuth Cleanup Candidates")
+    statuses = _prompt_oauth_cleanup_statuses()
+    result = _preview_oauth_cleanup_candidates(statuses=statuses)
+    _display_oauth_cleanup_candidates(result["candidates"])
+    console.print("\n[dim]Preview only: no files were deleted.[/dim]")
+
+
+async def _batch_delete_credentials_menu():
+    """Interactive dry-run plus confirmed execution for selected credentials."""
+    clear_screen("Batch Delete Selected Credentials")
+
+    console.print(
+        Panel(
+            Text.from_markup(
+                "[bold]Batch options:[/bold]\n"
+                "1. OAuth cleanup candidates by status\n"
+                "2. All API keys and OAuth credentials"
+            ),
+            title="Batch Delete Source",
+            style="bold blue",
+        )
+    )
+    source = Prompt.ask(
+        "Select source or type 'b' to go back",
+        choices=["1", "2", "b"],
+        show_choices=False,
+    )
+    if source.lower() == "b":
+        return
+
+    if source == "1":
+        statuses = _prompt_oauth_cleanup_statuses()
+        preview = _preview_oauth_cleanup_candidates(statuses=statuses)
+        candidates = preview["candidates"]
+    else:
+        candidates = _all_batch_delete_candidates()
+
+    _display_batch_delete_candidates(candidates)
+    if not candidates:
+        return
+
+    selection = Prompt.ask(
+        "Select candidate numbers to delete, 'all', or 'b' to go back",
+        default="all",
+        show_default=True,
+    )
+    indexes = _parse_oauth_cleanup_candidate_selection(selection, len(candidates))
+    if indexes is None:
+        console.print("[dim]Batch deletion cancelled.[/dim]")
+        return
+    if not indexes:
+        console.print("[bold red]Invalid selection. No credentials deleted.[/bold red]")
+        return
+
+    selected_candidates = [candidates[index] for index in indexes]
+    items = [
+        _batch_delete_item_from_candidate(candidate)
+        for candidate in selected_candidates
+    ]
+    dry_run_result = _batch_delete_selected_credentials(items, dry_run=True)
+
+    console.print("\n[bold cyan]Dry-run result:[/bold cyan]")
+    _display_batch_delete_candidates(
+        dry_run_result["candidates"],
+        title="Selected Credentials",
+    )
+    if dry_run_result["errors"]:
+        console.print("[bold red]Errors found; nothing was deleted:[/bold red]")
+        for error in dry_run_result["errors"]:
+            console.print(
+                f"  • {error.get('identifier', 'unknown')}: {error['detail']}"
+            )
+        return
+
+    console.print(
+        "\n[yellow]This deletes local credential entries/files only; "
+        "it does not revoke tokens upstream.[/yellow]"
+    )
+    confirmed = Confirm.ask(
+        f"Delete {len(selected_candidates)} selected credential(s)?",
+        default=False,
+    )
+    if not confirmed:
+        console.print("[dim]Batch deletion cancelled after dry-run.[/dim]")
+        return
+
+    result = _batch_delete_selected_credentials(items, dry_run=False, confirm=True)
+    if result["deleted"] and not result["errors"]:
+        console.print(
+            Panel(
+                f"Deleted {len(result['deleted'])} credential(s).",
+                style="bold green",
+                title="Success",
+                expand=False,
+            )
+        )
+    else:
+        console.print("[bold red]Batch deletion completed with errors:[/bold red]")
+        for error in result["errors"]:
+            console.print(
+                f"  • {error.get('identifier', 'unknown')}: {error['detail']}"
+            )
+
+
 async def manage_credentials_submenu():
     """
     Submenu for viewing and managing all credentials (API keys and OAuth).
@@ -843,7 +2051,9 @@ async def manage_credentials_submenu():
                     "[bold]Actions:[/bold]\n"
                     "1. Delete an API Key\n"
                     "2. Delete an OAuth Credential\n"
-                    "3. Edit OAuth Credential Email"
+                    "3. Edit OAuth Credential Email\n"
+                    "4. Preview OAuth Cleanup Candidates\n"
+                    "5. Batch Delete Selected Credentials"
                 ),
                 title="Choose action",
                 style="bold blue",
@@ -854,7 +2064,7 @@ async def manage_credentials_submenu():
             Text.from_markup(
                 "[bold]Select an option or type [red]'b'[/red] to go back[/bold]"
             ),
-            choices=["1", "2", "3", "b"],
+            choices=["1", "2", "3", "4", "5", "b"],
             show_choices=False,
         )
 
@@ -876,6 +2086,16 @@ async def manage_credentials_submenu():
         elif action == "3":
             # Edit OAuth Credential Email
             await _edit_oauth_credential_menu()
+            console.print("\n[dim]Press Enter to continue...[/dim]")
+            input()
+
+        elif action == "4":
+            await _preview_oauth_cleanup_menu()
+            console.print("\n[dim]Press Enter to continue...[/dim]")
+            input()
+
+        elif action == "5":
+            await _batch_delete_credentials_menu()
             console.print("\n[dim]Press Enter to continue...[/dim]")
             input()
 
@@ -934,15 +2154,37 @@ async def _delete_api_key_menu():
             console.print("[dim]Deletion cancelled.[/dim]")
             return
 
-        if _delete_api_key_from_env(key_name):
+        result = _batch_delete_selected_credentials(
+            [
+                {
+                    "type": "api_key",
+                    "provider": str(provider).lower(),
+                    "key_name": key_name,
+                }
+            ],
+            dry_run=False,
+            confirm=True,
+        )
+        if result["deleted"] and not result["errors"]:
             console.print(
                 Panel(
-                    f"Successfully deleted [yellow]{key_name}[/yellow]",
+                    f"Successfully deleted [yellow]{key_name}[/yellow] and cleaned usage data",
                     style="bold green",
                     title="Success",
                     expand=False,
                 )
             )
+        elif result["deleted"]:
+            console.print(
+                Panel(
+                    f"Deleted [yellow]{key_name}[/yellow], but usage cleanup reported errors",
+                    style="bold red",
+                    title="Partial Cleanup",
+                    expand=False,
+                )
+            )
+            for error in result["errors"]:
+                console.print(f"  • {error.get('detail', 'Unknown cleanup error')}")
         else:
             console.print(
                 Panel(
@@ -952,6 +2194,8 @@ async def _delete_api_key_menu():
                     expand=False,
                 )
             )
+            for error in result["errors"]:
+                console.print(f"  • {error.get('detail', 'Unknown deletion error')}")
 
     except Exception as e:
         console.print(f"[bold red]Error: {e}[/bold red]")
@@ -1020,20 +2264,38 @@ async def _delete_oauth_credential_menu():
             console.print("[dim]Deletion cancelled.[/dim]")
             return
 
-        # Use the auth class's delete method
-        provider_factory, _ = _ensure_providers_loaded()
-        auth_class = provider_factory.get_provider_auth_class(provider_name)
-        auth_instance = auth_class()
-
-        if auth_instance.delete_credential(cred_path):
+        result = _batch_delete_selected_credentials(
+            [
+                {
+                    "type": "oauth",
+                    "provider": provider_name,
+                    "filename": cred_info.get("filename") or Path(cred_path).name,
+                    "file_path": cred_path,
+                }
+            ],
+            dry_run=False,
+            confirm=True,
+        )
+        if result["deleted"] and not result["errors"]:
             console.print(
                 Panel(
-                    f"Successfully deleted credential for [cyan]{email}[/cyan]",
+                    f"Successfully deleted credential for [cyan]{email}[/cyan] and cleaned usage data",
                     style="bold green",
                     title="Success",
                     expand=False,
                 )
             )
+        elif result["deleted"]:
+            console.print(
+                Panel(
+                    f"Deleted credential for [cyan]{email}[/cyan], but usage cleanup reported errors",
+                    style="bold red",
+                    title="Partial Cleanup",
+                    expand=False,
+                )
+            )
+            for error in result["errors"]:
+                console.print(f"  • {error.get('detail', 'Unknown cleanup error')}")
         else:
             console.print(
                 Panel(
@@ -1043,6 +2305,8 @@ async def _delete_oauth_credential_menu():
                     expand=False,
                 )
             )
+            for error in result["errors"]:
+                console.print(f"  • {error.get('detail', 'Unknown deletion error')}")
 
     except Exception as e:
         console.print(f"[bold red]Error: {e}[/bold red]")
