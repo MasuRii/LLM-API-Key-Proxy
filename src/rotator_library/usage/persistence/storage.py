@@ -593,6 +593,7 @@ class UsageStorage:
                 cooldowns=cooldowns,
                 fair_cycle=fair_cycle,
                 status_snapshot=status_snapshot,
+                rpd_counters=data.get("rpd_counters", {}),
                 active_requests=0,  # Always starts at 0
                 optimal_concurrent=optimal_concurrent,
                 max_concurrent=max_concurrent,
@@ -662,6 +663,7 @@ class UsageStorage:
             ),
             "optimal_concurrent": state.optimal_concurrent,
             "max_concurrent": state.max_concurrent,
+            "rpd_counters": state.rpd_counters,
             "created_at": state.created_at,
             "created_at_human": _format_timestamp(state.created_at),
             "last_updated": state.last_updated,

@@ -84,6 +84,18 @@ class QuotaService:
                 )
                 for group_stats in stats.get("quota_groups", {}).values()
             )
+            # Also check per-credential group windows (e.g. Umans API-only quota)
+            if not has_quota_data:
+                for cred in (stats.get("credentials") or {}).values():
+                    for group in (cred.get("group_usage") or {}).values():
+                        for win in (group.get("windows") or {}).values():
+                            if win.get("limit") is not None:
+                                has_quota_data = True
+                                break
+                        if has_quota_data:
+                            break
+                    if has_quota_data:
+                        break
             if not has_requests and not has_quota_data:
                 continue
 
@@ -225,11 +237,13 @@ class QuotaService:
 
                     result["credentials_refreshed"] += len(creds_to_refresh)
 
-                    for cred_path, data in quota_results.items():
-                        if data.get("status") != "success":
+                    for cred_path, snapshot in quota_results.items():
+                        status = snapshot.status if hasattr(snapshot, "status") else snapshot.get("status")
+                        if status != "success":
                             result["failed_count"] += 1
+                            error = snapshot.error if hasattr(snapshot, "error") else snapshot.get("error", "Unknown error")
                             result["errors"].append(
-                                f"{Path(cred_path).name}: {data.get('error', 'Unknown error')}"
+                                f"{Path(cred_path).name}: {error}"
                             )
 
                 except Exception as e:

@@ -382,6 +382,9 @@ class CredentialState:
     # credential has explicit health metadata. This keeps unblocked credentials
     # indistinguishable from older state objects that never had the field.
 
+    # RPD (requests-per-day) counters: model -> {count, period_start, reset_at}
+    rpd_counters: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
     # Active requests (for concurrent request limiting)
     active_requests: int = 0
     # Soft target for selection. Values <= 0 mean no soft preference.
